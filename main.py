@@ -1,0 +1,3577 @@
+# main.py
+import ipaddress
+import re
+from urllib.parse import urlparse
+import cv2
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+from PIL import Image, ImageTk
+import threading
+import time
+import os
+import queue
+import shutil
+import subprocess
+import xml.etree.ElementTree as ET
+import json
+import logging
+import win_perf
+import argparse
+import sys
+import urllib.request as _urllib
+from pathlib import Path
+from typing import Optional
+import socketio as _sio
+import numpy as np
+import fd_slave_api
+import flask.cli
+flask.cli.show_server_banner = lambda *a, **k: None
+import video_sync
+import csv
+import fd_auth
+from logic_editor import load_logic_xml, validate as validate_logic, LogicEditorPanel
+from datetime import datetime, timedelta, timezone
+import urllib.error
+from source_hub import SourceHub
+from tile_view import compose, canvas_size, fixed_cell, grid_for, layout_meta, rec_cell
+
+try:
+
+    from ultralytics import YOLO as _YOLO
+
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+
+from video_recorder import VideoRecorder
+from api_sender import ApiSender
+from storage_manager import StorageManager, VIDEOS_DIR
+from logic_cycle_engine import LogicCycleEngine
+from system_monitor import SystemMonitor
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Logging
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+LOG_FILE = Path(__file__).parent / "logs" / "ct_monitor.log"
+_file_handler = None
+
+
+def set_file_logging(enabled: bool):
+    """Pasang/lepas handler file saat runtime. Handler konsol tidak disentuh."""
+    global _file_handler
+    root = logging.getLogger()
+    if enabled and _file_handler is None:
+        LOG_FILE.parent.mkdir(exist_ok=True)
+        h = logging.FileHandler(LOG_FILE, encoding="utf-8")
+        h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        root.addHandler(h)
+        _file_handler = h
+    elif not enabled and _file_handler is not None:
+        root.removeHandler(_file_handler)
+        _file_handler.close()
+        _file_handler = None
+def set_debug_logging(on: bool):
+    """ON: konsol + file. OFF: semua log mati (konsol dan file), termasuk modul lain."""
+    set_file_logging(on)
+    logging.disable(logging.NOTSET if on else logging.CRITICAL)
+
+def setup_logging(level_str: str, debug_files: bool = True):
+    level = getattr(logging, level_str.upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler()],      # konsol: selalu aktif
+    )
+    set_debug_logging(debug_files)
+
+logger = logging.getLogger(__name__)
+LOGIC_CONFIG_PATH = Path(__file__).parent / "config" / "logic_config.xml"
+PRESET_DIR = Path(__file__).parent / "setup-model"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Settings
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def load_settings(path: str = "config/ct_settings.json") -> dict:
+    defaults = {
+        "RECORDER_START_DELAY": 0.5,
+        "RECORDER_IDLE_TIMEOUT": 5.0,
+        "SEQUENCE_COMPLETE_DELAY": 1.0,
+        "ANOMALY_TIMER": 20.0,     # detik, diset user. Batas cycle time dianggap anomaly
+        "DISCARD_TIMEOUT": 300.0,
+        "MIN_CYCLE_TIME": 3.0,
+        "SHORT_ANOMALY_LIMIT": 0.0,   # detik; 0 = nonaktif
+    }
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        for key in defaults:
+            if key in loaded:
+                defaults[key] = loaded[key]
+        logger.info(f"[Settings] Loaded dari {path}")
+    except FileNotFoundError:
+        logger.warning(f"[Settings] {path} tidak ditemukan, pakai default")
+    return defaults
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Server / TaktTime
+# ═══════════════════════════════════════════════════════════════════════════════
+IDENTITY_PATH = Path(__file__).parent / "config" / "station_identity.json"
+SETUP_PATH = Path(__file__).parent / "config" / "setup_state.json"
+SERVER_CFG_PATH = Path(__file__).parent / "config" / "server_config.json"
+DEFAULT_MASTER = ("192.168.137.2", 3000)
+RESYNC_STATE_PATH = Path(__file__).parent / "config" / "resync_state.json"
+RESYNC_LOOKBACK_DAYS = 150      # sync pertama / checkpoint belum ada
+RESYNC_MARGIN_SEC = 3600
+
+def parse_master_input(host_text: str, port_text: str):
+    """Validasi input user. Return (host, port) atau raise ValueError."""
+    h = re.sub(r"^https?://", "", (host_text or "").strip(), flags=re.I).split("/")[0]
+    p_txt = (port_text or "").strip()
+    if ":" in h:
+        h, p_txt = h.rsplit(":", 1)
+    h = h.strip()
+    if not h:
+        raise ValueError("IP / hostname master wajib diisi.")
+    try:
+        ipaddress.ip_address(h)
+    except ValueError:
+        if not re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?", h):
+            raise ValueError(f"IP / hostname tidak valid: {h}")
+    try:
+        port = int(p_txt) if p_txt else DEFAULT_MASTER[1]
+    except ValueError:
+        raise ValueError("Port harus berupa angka.")
+    if not (1 <= port <= 65535):
+        raise ValueError("Port harus 1–65535.")
+    return h, port
+
+
+def build_endpoint(host: str, port: int) -> str:
+    return f"http://{host}:{port}/api/cycle"
+
+
+def load_server_cfg() -> dict:
+    try:
+        return json.loads(SERVER_CFG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_server_cfg(cfg: dict):
+    try:
+        SERVER_CFG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SERVER_CFG_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        os.replace(tmp, SERVER_CFG_PATH)
+    except Exception as e:
+        logger.warning(f"[ServerCfg] Gagal simpan: {e}")
+
+
+def remember_master(host: str, port: int):
+    """Dipanggil setelah koneksi BERHASIL: jadikan IP terakhir."""
+    cfg = load_server_cfg()
+    cfg.pop("pending", None)
+    cfg.update({"host": host, "port": port,
+                "last_ok_at": datetime.now().isoformat(timespec="seconds")})
+    save_server_cfg(cfg)
+
+
+def resolve_endpoint(cli_endpoint):
+    """CLI > pending (setelah restart) > terakhir terkoneksi > default."""
+    if cli_endpoint:
+        return cli_endpoint, "CLI"
+    cfg = load_server_cfg()
+    pend = cfg.pop("pending", None)
+    if pend:
+        save_server_cfg(cfg)                      # pending dipakai sekali
+        try:
+            h, p = parse_master_input(str(pend.get("host", "")), str(pend.get("port", "")))
+            return build_endpoint(h, p), "pending"
+        except ValueError:
+            pass
+    if cfg.get("host"):
+        try:
+            h, p = parse_master_input(str(cfg["host"]), str(cfg.get("port", "")))
+            return build_endpoint(h, p), "terakhir terkoneksi"
+        except ValueError:
+            pass
+    return build_endpoint(*DEFAULT_MASTER), "default"
+def save_identity(cfg: dict):
+    """Simpan identitas stasiun dari server agar FD bisa merekam saat server offline."""
+    keys = ("station_id", "line", "name", "takt_time", "roi_timeout_sec",
+            "min_cycle_sec", "ip", "port", "hostname")
+    try:
+        IDENTITY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        IDENTITY_PATH.write_text(
+            json.dumps({k: cfg.get(k) for k in keys}, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        logger.warning(f"[Identity] Gagal simpan: {e}")
+
+def load_resync_since(line, st):
+    try:
+        d = json.loads(RESYNC_STATE_PATH.read_text(encoding="utf-8"))
+        v = d.get(f"{line}_{st}")
+        return float(v) if v else None
+    except Exception:
+        return None
+
+
+def save_resync_since(line, st, ts: float):
+    try:
+        try:
+            d = json.loads(RESYNC_STATE_PATH.read_text(encoding="utf-8"))
+            if not isinstance(d, dict):
+                d = {}
+        except Exception:
+            d = {}
+        d[f"{line}_{st}"] = ts
+        RESYNC_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = RESYNC_STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, indent=2), encoding="utf-8")
+        os.replace(tmp, RESYNC_STATE_PATH)
+    except Exception as e:
+        logger.warning(f"[Resync] Gagal simpan checkpoint: {e}")
+def load_identity() -> dict:
+    try:
+        return json.loads(IDENTITY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def verify_server_connection(
+    base_url: str,
+    station_id: int,
+    max_attempts: int = 2,
+    connect_timeout: float = 4.0,
+    pong_timeout: float = 3.0,
+    http_timeout: float = 3.0,
+    retry_delay: float = 2.0,
+):
+    for attempt in range(1, max_attempts + 1):
+        logger.info(
+            f"[Startup] Verifikasi server {base_url} (attempt {attempt}/{max_attempts})..."
+        )
+        sio_client = _sio.Client(reconnection=True, logger=False)
+        pong_event = threading.Event()
+
+        @sio_client.on("pong")
+        def _on_pong(data):
+            pong_event.set()
+
+        try:
+            sio_client.connect(
+                base_url,
+                transports=["websocket"],
+                wait_timeout=connect_timeout,
+            )
+        except Exception as e:
+            logger.warning(f"[Startup] Socket.io gagal: {e}")
+            if attempt < max_attempts:
+                time.sleep(retry_delay)
+                continue
+            logger.error("[Startup] Server tidak dapat dijangkau.")
+            sys.exit(1)
+
+        sio_client.emit("ping", {"sent_at": time.time(), "station_id": station_id})
+        if not pong_event.wait(timeout=pong_timeout):
+            sio_client.disconnect()
+            if attempt < max_attempts:
+                time.sleep(retry_delay)
+                continue
+            logger.error("[Startup] Heartbeat gagal.")
+            sys.exit(1)
+
+        logger.info("[Startup] Heartbeat OK ✓")
+        try:
+            with _urllib.urlopen(f"{base_url}/api/summary", timeout=http_timeout) as r:
+                r.read()
+            logger.info("[Startup] HTTP /api/summary OK ✓")
+        except Exception as e:
+            sio_client.disconnect()
+            if attempt < max_attempts:
+                time.sleep(retry_delay)
+                continue
+            logger.error(f"[Startup] HTTP gagal: {e}")
+            sys.exit(1)
+
+        logger.info("[Startup] Server terverifikasi ✓")
+        return sio_client
+
+    sys.exit(1)
+
+class TaktTimeSource:
+    def __init__(self, base_url, station_id, line, initial_fallback, existing_sio=None):
+        self._base_url = base_url
+        self._station_id = station_id
+        self._line = line
+        self._value = initial_fallback
+        self._anomaly = float(initial_fallback)
+        self._discard = 300.0
+        self._server_connected = True
+        self._last_disconnect_logged = False
+        self._min = 3.0
+        self._short = None
+
+        if existing_sio is not None and existing_sio.connected:
+            self._sio = existing_sio
+            self._register_takt_listener()
+            self._register_connection_watchers()
+        else:
+            self._sio = _sio.Client(reconnection=True, logger=False)
+            self._setup_socket()
+    def _is_me(self, d):
+        return (str(d.get("station_id")) == str(self._station_id)
+                and str(d.get("line")) == str(self._line))
+
+    def _register_takt_listener(self):
+        @self._sio.on("takt_time_update")
+        def on_takt_update(data):
+            if str(data.get("station_id")) == str(self._station_id):
+                prev = self._value
+                self._value = float(data["takt_time"])
+                self._anomaly = self._value      # target_cycle_time = takt
+                logger.info(f"[TaktTime] PUSH: {prev}s → {self._value}s")
+
+        @self._sio.on("roi_timeout_update")
+        def on_roi_timeout(data):
+            if str(data.get("station_id")) == str(self._station_id):
+                self._discard = float(data["roi_timeout_sec"])
+                logger.info(f"[Timer] PUSH discard={self._discard}s")
+        @self._sio.on("min_cycle_update")                      # ← TAMBAH
+        def on_min_cycle(data):                                # ← TAMBAH
+            if str(data.get("station_id")) == str(self._station_id):
+                self._min = float(data["min_cycle_sec"])
+                logger.info(f"[Timer] PUSH min_cycle={self._min}s")
+        @self._sio.on("short_anomaly_update")
+        def on_short(data):
+            if str(data.get("station_id")) == str(self._station_id):
+                self._short = float(data["short_anomaly_sec"])
+                logger.info(f"[Timer] PUSH short_limit={self._short}s")
+
+    def _register_connection_watchers(self):
+        @self._sio.event
+        def connect():
+            self._server_connected = True
+            if self._last_disconnect_logged:
+                logger.info("[Server] Koneksi PULIH ✓")
+                self._last_disconnect_logged = False
+
+        @self._sio.event
+        def disconnect():
+            self._server_connected = False
+            logger.error("[Server] *** SERVER TERPUTUS ***")
+            self._last_disconnect_logged = True
+
+    def _setup_socket(self):
+        self._register_takt_listener()
+        self._register_connection_watchers()
+        try:
+            self._sio.connect(
+                self._base_url,
+                transports=["websocket"],
+                wait_timeout=5,
+            )
+        except Exception as e:
+            logger.warning(f"[TaktTime] Socket.io gagal: {e}")
+            self._server_connected = False
+
+    @property
+    def is_connected(self) -> bool:
+        try:
+            return bool(self._sio.connected)
+        except Exception:
+            return False
+
+    @property
+    def value(self) -> float:
+        return self._value
+    @property                                  # ← tempel mulai di sini
+    def anomaly_timer(self) -> float:
+        return self._anomaly
+
+    @property
+    def discard_timeout(self) -> float:
+        return self._discard                   # ← sampai sini
+    @property                                                  # ← TAMBAH
+    def min_cycle(self) -> float:                              # ← TAMBAH
+        return self._min      
+    @property
+    def short_limit(self):
+        return self._short
+    def disconnect(self):
+        try:
+            self._sio.disconnect()
+        except Exception:
+            pass
+
+    def refresh(self) -> float:
+        try:
+            with _urllib.urlopen(f"{self._base_url}/api/stations", timeout=3) as r:
+                rows = json.loads(r.read())
+            for s in rows:
+                if not self._is_me(s):
+                    continue
+                a = s.get("target_cycle_time") or s.get("takt_time")
+                if isinstance(a, (int, float)) and not isinstance(a, bool) and a > 0:
+                    self._anomaly = float(a)
+                t = s.get("takt_time")
+                if isinstance(t, (int, float)) and not isinstance(t, bool) and t > 0:
+                    prev, self._value = self._value, float(t)
+                    if self._value != prev:
+                        logger.info(f"[TaktTime] {prev}s → {self._value}s (backend)")
+                d = s.get("roi_timeout_sec")
+                if isinstance(d, (int, float)) and not isinstance(d, bool) and d > 0:
+                    self._discard = float(d)
+                m = s.get("min_cycle_sec")                     # ← TAMBAH
+                if isinstance(m, (int, float)) and not isinstance(m, bool) and m >= 0:   # ← TAMBAH
+                    self._min = float(m)   
+                sh = s.get("short_anomaly_sec")
+                if isinstance(sh, (int, float)) and not isinstance(sh, bool) and sh >= 0:
+                    self._short = float(sh)
+                break
+        except Exception as e:
+            logger.warning(f"[TaktTime] Gagal fetch: {e}")
+        return self._value
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FrameLogger
+# ═══════════════════════════════════════════════════════════════════════════════
+class FrameLogger:
+    def __init__(self, log_path: str, enabled: bool = True):
+        self._path = log_path
+        self._lock = threading.Lock()
+        self._file = None
+        self._start = time.time()
+        self.set_enabled(enabled)
+
+    @property
+    def enabled(self) -> bool:
+        return self._file is not None
+
+    def set_enabled(self, enabled: bool):
+        with self._lock:
+            if enabled and self._file is None:
+                self._file = open(self._path, "a", encoding="utf-8", buffering=1)
+                self._file.write(
+                    f"# CT Monitor Log\n"
+                    f"# Mulai: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"{'=' * 70}\n"
+                )
+            elif not enabled and self._file is not None:
+                self._file.write(
+                    f"{'=' * 70}\n"
+                    f"# Selesai: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                )
+                self._file.close()
+                self._file = None
+
+    def log(self, tag: str, msg: str, console: bool = True):
+        ms = (time.time() - self._start) * 1000
+        with self._lock:
+            if self._file:
+                self._file.write(f"{ms:10.1f}ms | {tag:<8} | {msg}\n")
+        if console:
+            logger.info(f"[{tag}] {msg}")
+
+    def close(self):
+        self.set_enabled(False)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CycleReporter (CSV lokal)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class CycleReporter:
+    
+    def __init__(self, output_dir: str):
+        os.makedirs(output_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._path = os.path.join(output_dir, f"cycle_report_{ts}.csv")
+        self._lock = threading.Lock()
+        with open(self._path, "w", encoding="utf-8", newline="") as f:
+            csv.writer(f).writerow(
+                [
+                    "cycle_number",
+                    "start_time",
+                    "end_time",
+                    "cycle_time_seconds",
+                    "anomaly",
+                    "genesis",
+                    "anomaly_label",
+                ]
+            )
+    def record(self, cycle_number, start_ts, end_ts, cycle_time, anomaly_type: str,
+               is_genesis: bool, anomaly_label: str = ""):
+        start_str = datetime.fromtimestamp(start_ts).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        end_str = datetime.fromtimestamp(end_ts).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        label = {"OK": "NO", "LONG": "YES_LONG", "SHORT": "YES_SHORT"}.get(anomaly_type, "NO")
+        with self._lock:
+            with open(self._path, "a", encoding="utf-8", newline="") as f:
+                csv.writer(f).writerow(
+                    [cycle_number, start_str, end_str, f"{cycle_time:.3f}", label,
+                     "YES" if is_genesis else "NO", anomaly_label])
+
+    def path(self) -> str:
+        return self._path
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  YOLOInference
+# ═══════════════════════════════════════════════════════════════════════════════
+class YOLOInference:
+    def __init__(self):
+        self._models = {}            # path -> YOLO (dipakai bersama bila path sama)
+        self._slot_model = {}        # slot -> path ("" = tanpa model)
+        self._failed = set()         # path yang gagal dimuat
+        self._loading = set()
+        self._load_lock = threading.Lock()
+        self.on_models_changed = None
+        self._conf = 0.25
+        self._imgsz = 640
+        self._out_lock = threading.Lock()
+        self._running = False
+        self._thread = None
+        self._enabled_slots: set = set()     # slot yang inferensinya aktif
+        self._tracked_classes: set = set()
+        self._engine: "LogicCycleEngine | None" = None
+        self.on_cycle_aborted = None   # callback(reason: str)
+        self.engine_enabled = True
+        self._pending = {}
+        self._pend_lock = threading.Lock()
+        self._wake = threading.Event()
+        self._out = {}              # slot -> (drawn, raw, dets)
+
+    # ── engine logika ──
+    def set_engine(self, engine):
+        self._engine = engine
+        self.engine_enabled = True     # False saat ROI sedang diedit
+        engine.on_cycle_aborted = self._relay_abort
+
+    def _relay_abort(self, reason: str):
+        if self.on_cycle_aborted:
+            try:
+                self.on_cycle_aborted(reason)
+            except Exception as e:
+                logger.error(f"[YOLO] on_cycle_aborted error: {e}", exc_info=True)
+    # ── aktivasi per source ──
+    @property
+    def enabled(self) -> bool:
+        """True bila minimal satu source aktif (kompatibel dengan kode lama)."""
+        return bool(self._enabled_slots)
+
+    @enabled.setter
+    def enabled(self, on: bool):
+        """Kompatibilitas: True = aktifkan semua slot yang punya model, False = matikan semua."""
+        if on:
+            self._enabled_slots = {s for s, p in self._slot_model.items() if p}
+        else:
+            self._enabled_slots.clear()
+            with self._out_lock:
+                self._out.clear()
+
+    def slot_enabled(self, slot) -> bool:
+        return slot in self._enabled_slots
+
+    def set_slot_enabled(self, slot, on: bool) -> bool:
+        """Aktif/nonaktifkan YOLO untuk satu source. Return status akhir slot."""
+        slot = int(slot)
+        if on:
+            if not self._slot_model.get(slot):      # slot tanpa model tidak bisa diaktifkan
+                return False
+            self._enabled_slots.add(slot)
+        else:
+            self._enabled_slots.discard(slot)
+            with self._pend_lock:                   # buang frame yang antre
+                self._pending.pop(slot, None)
+            with self._out_lock:                    # buang hasil lama agar tidak tampil beku
+                self._out.pop(slot, None)
+        return slot in self._enabled_slots
+    @property
+    def engine(self):
+        return self._engine
+
+    @property
+    def _tracker(self):          # alias sementara: kode lama masih memakai yolo._tracker
+        return self._engine
+
+    def reset_counts(self):
+        if self._engine:
+            self._engine.reset_count()
+
+    def set_conf(self, v: float):
+        self._conf = max(0.01, min(1.0, v))
+
+    def set_tracked_classes(self, classes: set):
+        self._tracked_classes = set(classes)
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        self._wake.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    @staticmethod
+    def _names_of(m) -> dict:
+        n = m.names
+        return dict(n) if isinstance(n, dict) else dict(enumerate(n))
+
+    def assign(self, mapping: dict, retry: bool = False):
+        """mapping {slot: path}. Model baru dimuat di background, yang tak terpakai dilepas."""
+        clean = {int(s): (p or "").strip() for s, p in mapping.items()}
+        need = {p for p in clean.values() if p}
+        with self._load_lock:
+            self._slot_model = clean
+            self._enabled_slots &= {s for s, p in clean.items() if p}
+            if retry:
+                self._failed.clear()
+            self._failed &= need
+            for p in [p for p in self._models if p not in need]:
+                del self._models[p]
+            todo = [p for p in need if p not in self._models
+                    and p not in self._loading and p not in self._failed]
+            self._loading.update(todo)
+        with self._out_lock:                      # slot tanpa model: buang hasil lama
+            for s in [s for s in self._out if not clean.get(s)]:
+                del self._out[s]
+        for p in todo:
+            threading.Thread(target=self._load_bg, args=(p,), daemon=True,
+                             name="yolo-load").start()
+
+    def _load_bg(self, path):
+        model = None
+        try:
+            if not YOLO_AVAILABLE:
+                raise RuntimeError("ultralytics belum terpasang")
+            if not os.path.exists(path):
+                raise FileNotFoundError(path)
+            model = _YOLO(path)
+        except Exception as e:
+            logger.error(f"[YOLO] gagal memuat {path}: {e}")
+        with self._load_lock:
+            self._loading.discard(path)
+            if model is None:
+                self._failed.add(path)
+            elif path in self._slot_model.values():
+                self._models[path] = model
+        if self.on_models_changed:
+            try:
+                self.on_models_changed()
+            except Exception as e:
+                logger.error(f"[YOLO] on_models_changed error: {e}", exc_info=True)
+
+    def slot_state(self, slot) -> str:
+        """none | loading | failed | ready"""
+        p = self._slot_model.get(slot, "")
+        if not p:
+            return "none"
+        if p in self._models:
+            return "ready"
+        return "failed" if p in self._failed else "loading"
+
+    def any_ready(self) -> bool:
+        return bool(self._models)
+
+    def summary(self) -> list:
+        return [(s, os.path.basename(p) if p else "", self.slot_state(s))
+                for s, p in sorted(self._slot_model.items())]
+
+    def get_class_names(self, slot=None) -> dict:
+        if slot is not None:
+            m = self._models.get(self._slot_model.get(slot, ""))
+            return self._names_of(m) if m else {}
+        labels = sorted({str(n) for m in list(self._models.values())
+                         for n in self._names_of(m).values()})
+        return dict(enumerate(labels))
+
+    def push(self, frame, slot=1):
+        if slot not in self._enabled_slots or self.slot_state(slot) != "ready":
+            return                                  # source ini tidak aktif / tanpa model
+        with self._pend_lock:
+            self._pending[slot] = frame
+        self._wake.set()
+
+    def _loop(self):
+        while self._running:
+            self._wake.wait(timeout=0.5)
+            self._wake.clear()
+            with self._pend_lock:
+                batch, self._pending = self._pending, {}
+            for slot, raw in sorted(batch.items()):
+                if not self._running:
+                    break
+                if slot not in self._enabled_slots:     # sudah dimatikan saat antre
+                    continue
+                model = self._models.get(self._slot_model.get(slot, ""))
+                if model is None:
+                    continue
+                try:
+                    results = model.predict(
+                        source=raw, conf=self._conf, imgsz=self._imgsz, verbose=False)
+                    drawn, dets = self._draw_and_track(raw.copy(), results, slot)
+                except Exception as e:
+                    logger.error(f"[YOLO] infer error: {e}", exc_info=True)
+                    drawn, dets = raw.copy(), []
+                with self._out_lock:
+                    if slot in self._enabled_slots:     # jangan tulis kalau dimatikan saat inferensi
+                        self._out[slot] = (drawn, raw, dets)
+
+    def _draw_and_track(self, frame, results, slot=1):
+        palette = [
+            (0, 200, 255), (0, 255, 100), (255, 80, 80), (255, 200, 0),
+            (180, 0, 255), (0, 180, 180), (255, 140, 0), (100, 255, 0),
+        ]
+        dets, boxes = [], []
+        for result in results:
+            if result.boxes is None:
+                continue
+            for box in result.boxes:
+                conf = float(box.conf[0])
+                cls_id = int(box.cls[0])
+                label = result.names.get(cls_id, str(cls_id))
+                if self._tracked_classes and label not in self._tracked_classes:
+                    continue
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                color = palette[cls_id % len(palette)]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                text = f"{label} {conf:.2f}"
+                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+                cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
+                cv2.putText(frame, text, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.circle(frame, (cx, cy), 4, (255, 255, 255), -1)
+                cv2.circle(frame, (cx, cy), 4, color, 1)
+                dets.append({"label": label, "conf": conf,
+                             "bbox": (x1, y1, x2, y2), "center": (cx, cy)})
+                boxes.append((x1, y1, x2, y2, label, conf))
+        # Selalu dipanggil tiap inferensi (termasuk boxes kosong) agar dwell/grace bisa berakhir
+        if self._engine and self.engine_enabled:
+            self._engine.update(boxes, source=slot)
+        return frame, dets
+    def get_result(self, slot=1):
+        with self._out_lock:
+            drawn, raw, dets = self._out.get(slot, (None, None, []))
+            return drawn, raw, list(dets)
+class ROIViewer:
+    """Menggambar ROI dari logic_config (hanya-baca) di atas preview RGB."""
+    COLORS = {"input": (60, 200, 80), "output": (30, 130, 240),
+              "mandatory": (255, 120, 30), "expected": (240, 200, 40)}
+
+    def __init__(self, engine_getter, slot_getter=lambda: 1):
+        self._get = engine_getter
+        self._slot = slot_getter
+        self._sx = self._sy = 1.0
+
+    def set_scale(self, preview_w, preview_h, frame_w, frame_h):
+        if preview_w and preview_h and frame_w and frame_h:
+            self._sx = preview_w / frame_w
+            self._sy = preview_h / frame_h
+
+    def draw_on_frame(self, frame, slot=None):
+        eng = self._get()
+        cfg = eng.cfg if eng else None
+        if cfg is None:
+            return frame
+        status = eng.status()
+        seq_no = {r.id: i for i, r in enumerate(cfg.sequence, 1)}
+        slot = self._slot() if slot is None else slot
+        for r in cfg.all_rois():
+            if r.source != slot:
+                continue
+            pts = [(int(x * self._sx), int(y * self._sy)) for x, y in r.points()]
+            color = self.COLORS.get(r.role if r.role != "sequence" else r.tag, (255, 255, 255))
+            st = status.get(r.id)
+            done = bool(st and st[0] == "done")
+            if r.role == "input":
+                label = "IN"
+            elif r.role == "output":
+                label = "OUT"
+            else:
+                label = f"{seq_no[r.id]}:{'M' if r.tag == 'mandatory' else 'E'}"
+            if done:
+                label += " OK"
+            elif st and st[0] == "skip":
+                label += " SKIP"
+            cv2.polylines(frame, [np.array(pts, np.int32).reshape(-1, 1, 2)],
+                          True, color, 3 if done else 2, cv2.LINE_AA)
+            lx, ly = min(pts, key=lambda p: (p[1], p[0]))   # titik teratas = jangkar label
+            ty = ly - 5 if ly > 18 else ly + 16
+            cv2.putText(frame, label, (lx + 3, ty), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(frame, label, (lx + 3, ty), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, color, 1, cv2.LINE_AA)
+        return frame
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Shift (waktu lokal)
+#  Shift 1: 19:00 - 07:00   |   Shift 2: 07:00 - 19:00
+# ═══════════════════════════════════════════════════════════════════════════════
+_VIDEO_TS_RE = re.compile(r"_(\d{8})_(\d{6})")
+
+
+def shift_info(now: datetime):
+    """Return (nama, awal, akhir) shift yang sedang berjalan pada waktu `now`."""
+    h = now.hour
+    if h >= 19 or h < 7:
+        name = "Shift 1"
+        start = now.replace(hour=19, minute=0, second=0, microsecond=0)
+        if h < 7:                       # lewat tengah malam: shift mulai kemarin 19:00
+            start -= timedelta(days=1)
+    else:
+        name = "Shift 2"
+        start = now.replace(hour=7, minute=0, second=0, microsecond=0)
+    return name, start, start + timedelta(hours=12)
+
+def _video_time(p: Path):
+    """Waktu video dari nama file (YYYYMMDD_HHMMSS); fallback ke mtime."""
+    m = _VIDEO_TS_RE.search(p.name)
+    if m:
+        try:
+            return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+        except ValueError:
+            pass
+    try:
+        return datetime.fromtimestamp(p.stat().st_mtime)
+    except OSError:
+        return None
+
+
+def count_shift_videos(start: datetime, end: datetime):
+    """Hitung video normal / anomali yang direkam dalam [start, end)."""
+    ok = anom = 0
+    for sub, is_ok in (("normal", True), ("anomali", False)):
+        for f in VIDEOS_DIR.glob(f"*/*/{sub}/*.mp4"):
+            if f.name.startswith("_tmp_"):
+                continue
+            t = _video_time(f)
+            if t and start <= t < end:
+                if is_ok:
+                    ok += 1
+                else:
+                    anom += 1
+    return ok, anom
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CTMonitorApp
+# ═══════════════════════════════════════════════════════════════════════════════
+class CTMonitorApp:
+    OUTPUT_FPS = 24
+
+    def __init__(self, root: tk.Tk, args):
+        self.root = root
+        self.args = args
+        self._ui_q: queue.Queue = queue.Queue()   # harus ada sebelum self._ui() dipanggil
+        self._resync_busy = False
+        self._logic_path: Path = LOGIC_CONFIG_PATH      # path aktif (bisa diganti lewat file picker)
+        self.hub = SourceHub(self._on_source_frame)
+        fd_slave_api.set_slot_source(self.hub.frame)
+        self._view_slot = 1
+        self._adapted = {}          # slot -> (w, h, mirror) terakhir yang di-adapt
+        self._view_mode = "single"      # single | tile
+        self._tile_n = 2
+        self._tile_scroll = 0        # offset piksel vertikal
+        self._tile_total = 0         # tinggi kanvas penuh
+        self._tile_step = 1          # tinggi satu baris tile (langkah scroll)
+        self._tile_sb_shown = False
+        self._last_n = 0
+        self._rec_slots = []
+        self._rec_cell = (0, 0)
+        self._cell = None            # sel kanvas siklus/stream (resolusi asli, dibatasi REC_CAP)
+        self._comp_run = False
+        self._comp_thread = None
+        self._mode_before_editor = "single"
+        try:
+            self._logic_config = load_logic_xml(self._logic_path)
+            logger.info(
+                "[Logic] Config dimuat dari %s (%d ROI sequence)",
+                self._logic_path,
+                len(self._logic_config.sequence),
+            )
+        except (OSError, ET.ParseError, ValueError, TypeError) as e:
+            self._logic_config = None
+            logger.error("[Logic] Gagal membaca %s: %s", self._logic_path, e)
+        self.root.title(f"CT Monitor — Station {args.station}")
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        self._compact = sw <= 1280 or sh <= 800          # mode layar kecil
+        w = min(1280, sw)
+        h = min(760, sh - 48)                            # sisakan ruang taskbar
+        self.root.geometry(f"{w}x{h}+0+0")
+        self.root.minsize(1, 1)
+
+        # ── Kamera state ───────────────────────────────────────────────────
+        self.running = False
+        self.recording = False
+        self.record_start_time = None
+        self._ffmpeg_raw = None
+        self._ffmpeg_ann = None
+        self._video_raw = None
+        self._video_ann = None
+        self._frame_lock = threading.Lock()
+        self._latest_frame = None
+        self._frame_w = 640
+        self._frame_h = 480
+        self._writer_thread = None
+        self._write_queue = queue.Queue(maxsize=120)
+        self._paused = False
+
+        # ── YOLO ───────────────────────────────────────────────────────────
+        self.yolo = YOLOInference()
+        self.yolo.on_models_changed = lambda: self._ui(self._on_models_ready)
+        self.yolo.set_engine(LogicCycleEngine())
+        self._attach_cycle_callbacks()
+        self.yolo.on_cycle_aborted = self._on_cycle_aborted
+        self.yolo.start()
+        # ── ROI state ──────────────────────────────────────────────────────
+
+
+        # ── Server / cycle state ───────────────────────────────────────────
+        self._server_lock = threading.Lock()   # cegah init/reconnect berjalan dobel
+        self._slave_started = False
+        self._hb_started = False
+        self._hold_state_until = 0.0
+        self._live_state = "IDLE"
+        self._state_evt = threading.Event()
+        self._takt: Optional[TaktTimeSource] = None
+        self._sender: Optional[ApiSender] = None
+        self._ct_recorder: Optional[VideoRecorder] = None  # cycle-time recorder
+        self._storage = None
+        self._server_connected = True
+        self._server_disconnected_since: float | None = None
+
+        # ── Settings ───────────────────────────────────────────────────────
+        self._settings_path = Path(__file__).parent / "config" / "ct_settings.json"
+        self._cfg = load_settings(str(self._settings_path))
+        self._sender = ApiSender(base_url=self.args.endpoint.replace("/api/cycle", "/api"))
+        self._storage = StorageManager()
+        self._storage.start()
+
+        # ── Output dir ─────────────────────────────────────────────────────
+        self.output_dir = os.path.join(os.getcwd(), "captures")
+        os.makedirs(self.output_dir, exist_ok=True)
+        self._debug_var = tk.BooleanVar(value=not getattr(args, "nondebug", False))
+        log_name = f"framelog_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        self._logger = FrameLogger(os.path.join(self.output_dir, log_name),
+                                enabled=self._debug_var.get())
+        self._reporter: Optional[CycleReporter] = None
+
+        # ── Tk vars ────────────────────────────────────────────────────────
+        self._var_station  = tk.StringVar(value="—")   # ← nilai dari server, bukan args
+        self._var_line     = tk.StringVar(value="—")   # ← BARU
+        self._var_name     = tk.StringVar(value="—")   # ← BARU
+        self._var_ip       = tk.StringVar(value="—")   # ← BARU
+        self._var_port     = tk.StringVar(value="—")   # ← BARU
+        self._var_host     = tk.StringVar(value="—")   # ← BARU
+        self._var_operator = tk.StringVar(value=args.operator or "—")
+        self._var_state    = tk.StringVar(value="IDLE")
+        self._var_cycle    = tk.StringVar(value="0")
+        self._var_elapsed  = tk.StringVar(value="—")
+        self._var_last_ct  = tk.StringVar(value="—")
+        self._var_avg_ct   = tk.StringVar(value="—")
+        self._ct_history: list[float] = []
+        self._var_takt     = tk.StringVar(value=f"{args.takt_time:.1f}s")
+        self._var_anom_lim = tk.StringVar(value="—")
+        self._var_disc_lim = tk.StringVar(value="—")
+        self._var_min_lim  = tk.StringVar(value="—")
+        self._var_ok_count = tk.StringVar(value="0")
+        self._var_shift = tk.StringVar(value="—")
+        self._var_clock = tk.StringVar(value="—")
+        self._shift_key = None          # awal shift aktif; berubah = ganti shift
+        self._shift_ok = 0
+        self._shift_anom = 0
+        self._var_anom_count = tk.StringVar(value="0")
+        self._var_server   = tk.StringVar(value="Menghubungkan...")
+        _u = urlparse(args.endpoint)
+        self._var_master_ip = tk.StringVar(value=_u.hostname or "")
+        self._var_master_port = tk.StringVar(value=str(_u.port or DEFAULT_MASTER[1]))
+        self._slave_base = None
+
+        self.width = tk.IntVar(value=640)
+        self.height = tk.IntVar(value=480)
+        self.fps = tk.IntVar(value=24)
+        self.format_var = tk.StringVar(value="mp4 (H.264)")
+        self.mirror_var = tk.BooleanVar(value=False)
+        self.status_var = tk.StringVar(value="Kamera belum dibuka")
+        self.record_status_var = tk.StringVar(value="READY")
+        self.timer_var = tk.StringVar(value="00:00:00")
+        self.folder_var = tk.StringVar(value=self.output_dir)
+        self.photo_count_var = tk.StringVar(value="Foto: 0")
+        self._photo_count = 0
+        self.model_info_var = tk.StringVar(value="Belum ada source")
+        self.conf_var = tk.DoubleVar(value=0.25)
+        self._roi_min_conf = 1.0
+        self.det_count_var = tk.StringVar(value="Deteksi: 0")
+        self._class_vars: dict[str, tk.BooleanVar] = {}
+        self._saved_disabled_classes: set[str] = set()
+        self._tracked_classes: set[str] = set()
+        self.cycle_var = tk.StringVar(value="—")
+        self._var_logic_file = tk.StringVar(value=self._logic_path.name)
+        self._var_active_cfg = tk.StringVar(value="—")   # ← TAMBAH: config yang dipakai START
+        self._var_preset = tk.StringVar(value="")
+        self._var_logic = tk.StringVar(value="—")
+        self._var_short_lim = tk.StringVar(value="—")
+        self.sysmon = SystemMonitor(interval=1.0)
+        self.sysmon.start()
+        self._var_cpu = tk.StringVar(value="—")
+        self._var_proc_cpu = tk.StringVar(value="—")
+        self._var_ram = tk.StringVar(value="—")
+        self._var_proc_ram = tk.StringVar(value="—")
+        self._var_gpu = tk.StringVar(value="—")
+        self._roi_editor = None
+        self._mode = "dev"              # "dev" | "production"
+        self._startup_mode = "dev"      # dibaca dari setup_state.json
+        self._build_ui()
+        self._bind_shortcuts()
+        self._restore_setup()
+        self._init_logic_engine()        
+        self.root.protocol("WM_DELETE_WINDOW", self.close_app)
+        self.mirror_var.trace_add("write", lambda *_: self.running and self._sync_sources())
+        # Mulai koneksi server di background
+        # Antrean UI untuk thread background (dibuat di awal __init__)
+        self._drain_ui_q()
+        self._sysmon_tick()
+        self.authenticated = False
+        self._login_start = False                # ← TAMBAH (sebelum _require_login)
+        if not self._require_login():
+            self._logger.close()
+            sys.exit(0)
+        self.authenticated = True
+        if self._login_start:                                   # tombol START
+            self._set_mode("production")
+            self._on_start_production()
+        else:                                                   # login password -> selalu Dev
+            self._set_mode("dev", persist=(self._startup_mode != "dev"))
+        self._shift_tick()
+        threading.Thread(target=self._lag_watchdog, daemon=True, name='lag-watchdog').start()
+        # Server baru dihubungi setelah login berhasil
+        threading.Thread(target=self._init_server, daemon=True).start()
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Server init (background)
+    # ──────────────────────────────────────────────────────────────────────
+    def _ui(self, fn):
+        """Panggil dari thread mana pun: fn dieksekusi di main thread."""
+        self._ui_q.put(fn)
+
+    def _drain_ui_q(self):
+        try:
+            while True:
+                fn = self._ui_q.get_nowait()
+                try:
+                    fn()
+                except Exception as e:
+                    logger.error(f"[UI] callback error: {e}", exc_info=True)
+        except queue.Empty:
+            pass
+        self.root.after(50, self._drain_ui_q)
+    def _on_transport_pick(self, _=None):
+        mode = self._transport_combo.get().strip().lower()
+        raw = self._udp_port_var.get().strip()
+        port = None
+        if raw:
+            try:
+                port = int(raw)
+                if not (1 <= port <= 65535):
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Transport", "Port UDP harus angka 1-65535 (kosong = otomatis).")
+                return
+        if not fd_slave_api.set_transport(mode, port):
+            messagebox.showerror("Transport", "Gagal menyimpan pengaturan transport.")
+            return
+        eff = f" (port UDP {fd_slave_api.get_udp_port()})" if mode == "udp" else ""
+        self.root_status.config(
+            text=f"Kirim status via {mode.upper()}{eff} - berlaku dalam beberapa detik")
+        logger.info(f"[Transport] {mode.upper()}{eff}")
+    def _reconnect_server(self):
+        if self._server_lock.locked():
+            return
+        self._reconnect_btn.config(state="disabled")
+        self.root_status.config(text="Reconnect ke server...")
+        logger.info("[Server] Reconnect manual diminta")
+        threading.Thread(target=self._init_server, daemon=True).start()
+    def _apply_master_target(self):
+        if self._server_lock.locked():
+            self.root_status.config(text="Koneksi sedang berjalan, tunggu sebentar...")
+            return
+        try:
+            host, port = parse_master_input(self._var_master_ip.get(),
+                                            self._var_master_port.get())
+        except ValueError as e:
+            messagebox.showerror("Server Master", str(e))
+            return
+        self._var_master_ip.set(host)
+        self._var_master_port.set(str(port))
+        new_base = f"http://{host}:{port}"
+
+        # fd_slave_api sudah berjalan ke server lama -> perlu restart
+        if self._slave_started and self._slave_base and new_base != self._slave_base:
+            if not messagebox.askyesno(
+                "Server Master",
+                f"Target diganti ke {host}:{port}.\n"
+                "Aplikasi perlu dimulai ulang agar berlaku. Restart sekarang?"):
+                return
+            cfg = load_server_cfg()
+            cfg["pending"] = {"host": host, "port": port}
+            save_server_cfg(cfg)
+            self._restart_app()
+            return
+
+        self.args.endpoint = build_endpoint(host, port)
+        logger.info(f"[Server] Target master diubah ke {new_base}")
+        self._reconnect_server()
+
+    def _restart_app(self):
+        self.close_app()
+        try:
+            if self.root.winfo_exists():      # user membatalkan penutupan
+                return
+        except tk.TclError:
+            pass
+        argv, skip = [], False
+        for a in sys.argv[1:]:                # buang --endpoint agar pending berlaku
+            if skip:
+                skip = False
+                continue
+            if a == "--endpoint":
+                skip = True
+                continue
+            if a.startswith("--endpoint="):
+                continue
+            argv.append(a)
+        subprocess.Popen([sys.executable, sys.argv[0], *argv])
+        os._exit(0)
+
+    def _sync_videos_now(self):
+        """Tombol manual: kirim ulang siklus terlambat + sinkron ukuran, satu proses."""
+        if self._resync_busy:
+            return
+        if not (self.args.line and self.args.station_no):
+            messagebox.showwarning("Sync Video", "Identitas stasiun belum diketahui.")
+            return
+        self._resync_busy = True
+        base_url = self.args.endpoint.replace("/api/cycle", "")
+        line, st = self.args.line, self.args.station_no
+        self.root_status.config(text="Sync video: memulai...")
+
+        def say(t):
+            self._ui(lambda: self.root_status.config(text=t))
+
+        def work():
+            try:
+                out = video_sync.sync_all(base_url, line, st, force=False, min_age=0.0, say=say)
+                if out is None:
+                    say("Sync video: sedang berjalan (otomatis), coba lagi sebentar lagi")
+                    return
+                r, s = out["resend"] or {}, out["sizes"] or {}
+                if "error" in r:
+                    say(f"Sync video: kirim ulang gagal ({r['error']}) | ukuran {s.get('ok', 0)} OK")
+                    return
+                say(f"Sync video selesai: {r.get('sent', 0)} dikirim ulang | "
+                    f"{r.get('known', 0)} sudah ada | {r.get('no_file', 0)} file hilang | "
+                    f"{r.get('failed', 0)} gagal | ukuran {s.get('ok', 0)} OK, "
+                    f"{s.get('not_found', 0)} belum ada di server")
+            except Exception as e:
+                logger.error(f"[VideoSync] error: {e}", exc_info=True)
+                say(f"Sync video gagal: {e}")
+            finally:
+                self._resync_busy = False
+
+        threading.Thread(target=work, daemon=True, name="video-sync-manual").start()
+    def _init_server(self):
+        # Hanya satu proses init/reconnect pada satu waktu
+        if not self._server_lock.acquire(blocking=False):
+            return
+        try:
+            self._do_init_server()
+        finally:
+            self._server_lock.release()
+            self._ui( lambda: self._reconnect_btn.config(state="normal"))
+
+    def _register_station_update(self):
+        @self._takt._sio.on("station_update")
+        def _on_station_update(data):
+            if (str(data.get("station_id")) != str(self.args.station)
+                    or str(data.get("line")) != str(self.args.line)):
+                return
+            new_name = data.get("name")
+            if not new_name:
+                return
+            fd_slave_api._station_config["name"] = new_name
+            self._ui( lambda n=new_name: self._var_name.set(n))
+            self._ui( lambda n=new_name: self.root.title(
+                f"CT Monitor — {n} ({self.args.line})"))
+            logger.info(f"[FD] Nama station diperbarui: {new_name}")
+
+    def _apply_cached_identity(self):
+        cfg = load_identity()
+        if not cfg.get("station_id") or not cfg.get("line"):
+            ln, st = fd_auth.identity()
+            if not (ln and st):
+                logger.error("[FD] Server offline dan tidak ada identitas — rekaman lokal tidak bisa jalan")
+                return
+            cfg = {"station_id": st, "line": ln}
+        self.args.station = self.args.station_no = cfg["station_id"]
+        self.args.line = cfg["line"]
+        self._ui(self._sync_recorder)
+        if cfg.get("takt_time"):
+            self.args.takt_time = cfg["takt_time"]
+        self._ui( lambda: self._var_station.set(str(cfg["station_id"])))
+        self._ui( lambda: self._var_line.set(str(cfg["line"])))
+        self._ui( lambda: self._var_name.set(cfg.get("name") or "—"))
+        self._ui( lambda: self.root_status.config(
+            text="Server offline — pakai identitas tersimpan, rekaman lokal tetap jalan"))
+        logger.warning(f"[FD] Server offline — identitas dari cache: "
+                       f"ST{cfg['station_id']} L{cfg['line']}")
+
+    def _do_init_server(self):
+        base_url = self.args.endpoint.replace("/api/cycle", "")
+        verified_sio = None
+        try:
+            self._ui(lambda: self._var_server.set("Menghubungkan..."))
+            self._ui(lambda: self._server_indicator.config(fg="#888"))
+
+            # Bersihkan koneksi lama (jika ada)
+            old = self._takt
+            if old is not None:
+                self._takt = None          # supaya UI loop tidak menimpa status
+                old.disconnect()
+
+            verified_sio = verify_server_connection(base_url=base_url, station_id=0)
+
+            if not self._slave_started:
+                fd_slave_api.start(server_url=base_url, port=5001)
+                self._slave_started = True
+                self._slave_base = base_url
+            else:
+                fd_slave_api._ensure_registration()      # Reconnect setelah 403 / registrasi mati
+
+            cfg = {}
+            for _ in range(30):
+                if fd_slave_api._station_config:          # hanya data live dari server
+                    cfg = fd_slave_api._station_config.copy()
+                    break
+                time.sleep(1)
+
+            if not cfg:
+                logger.error("[FD] Gagal dapat config — IP belum terdaftar di server")
+                try:
+                    verified_sio.disconnect()
+                except Exception:
+                    pass
+                self._ui(lambda: self._var_server.set("IP TIDAK TERDAFTAR"))
+                self._ui(lambda: self._server_indicator.config(fg="#e53935"))
+                return
+
+            self.args.station    = cfg["station_id"]
+            self.args.station_no = cfg["station_id"]
+            self.args.line       = cfg["line"]
+            self.args.takt_time  = cfg["takt_time"]
+            save_identity(cfg)
+            self._ui(self._sync_recorder)
+            self._ui(lambda: self._var_station.set(str(cfg["station_id"])))
+            self._ui(lambda: self._var_line.set(cfg.get("line", "—")))
+            self._ui(lambda: self._var_name.set(cfg.get("name", "—")))
+            self._ui(lambda: self._var_takt.set(f"{cfg['takt_time']:.1f}s"))
+            self._ui(lambda: self._var_ip.set(cfg.get("ip", "—")))
+            self._ui(lambda: self._var_port.set(str(cfg.get("port", "—"))))
+            self._ui(lambda: self._var_host.set(cfg.get("hostname", "—")))
+            self._ui(lambda: self.root.title(
+                f"CT Monitor — {cfg.get('name','?')} ({cfg.get('line','?')})"
+            ))
+            logger.info(
+                f"[FD] Identity: ST{cfg['station_id']} | {cfg['line']} | "
+                f"{cfg['name']} | takt={cfg['takt_time']}s | "
+                f"ip={cfg.get('ip')}:{cfg.get('port')} | host={cfg.get('hostname')}"
+            )
+
+            takt = TaktTimeSource(
+                base_url=base_url,
+                station_id=self.args.station,
+                line=self.args.line,
+                initial_fallback=self.args.takt_time,
+                existing_sio=verified_sio,
+            )
+            self._takt = takt
+            self._register_station_update()
+            takt.refresh()
+            if cfg.get("min_cycle_sec") is not None:
+                takt._min = float(cfg["min_cycle_sec"])
+
+            self._sender.set_base_url(f"{base_url}/api")
+
+            if not self._hb_started:
+                self._hb_started = True
+                threading.Thread(target=self._state_heartbeat_loop, daemon=True,
+                                 name="state-heartbeat").start()
+
+            if self._storage is None:
+                self._storage = StorageManager()
+                self._storage.start()
+            video_sync.start_background(
+                lambda: self.args.endpoint.replace("/api/cycle", ""),
+                lambda: (self.args.line, self.args.station_no))   # tiap 5 menit
+            self._server_connected = True
+            _u = urlparse(base_url)
+            remember_master(_u.hostname, _u.port or DEFAULT_MASTER[1])
+            self._server_disconnected_since = None
+            self._ui(lambda: self._var_server.set("Terhubung ✓"))
+            self._ui(lambda: self._server_indicator.config(fg="#4caf50"))
+            self._ui(lambda: self.root_status.config(text="Server terhubung ✓"))
+            logger.info("[Server] Inisialisasi selesai ✓")
+
+        except SystemExit:
+            self._apply_cached_identity()
+            self._ui(lambda: self._var_server.set("GAGAL KONEK"))
+            self._ui(lambda: self._server_indicator.config(fg="#e53935"))
+            self._ui(lambda: self.root_status.config(
+                text="Gagal konek server — klik Reconnect untuk coba lagi"))
+            logger.error("[Server] Koneksi gagal — fitur server dinonaktifkan")
+
+    def _auth_identity(self):
+        """(line, station_id) milik FD ini: live dari server bila sudah ada, kalau tidak dari cache."""
+        st, ln = self.args.station_no, self.args.line
+        if st and ln:
+            return ln, st
+        cfg = load_identity()
+        return cfg.get("line"), cfg.get("station_id")
+    def _lag_watchdog(self):
+        last = time.perf_counter()
+        while True:
+            time.sleep(1.0)
+            now = time.perf_counter()
+            lag = now - last - 1.0
+            if lag > 0.5:
+                logger.warning(f"[Lag] thread tertunda {lag:.2f}s "
+                            f"(HB={fd_slave_api.is_hb_connected()})")
+            last = now
+    def _require_login(self, startup: bool = True) -> bool:
+        """Dialog login modal. Evaluasi kode LOKAL (fd_auth + fa_keycore), tanpa server.
+        startup=True : jendela utama disembunyikan selama login (peluncuran aplikasi).
+        startup=False: relogin untuk masuk Setting Mode, jendela utama tetap tampil."""
+        if startup:
+            self.root.withdraw()
+        result = {"ok": False, "start": False}
+        n_digits = fd_auth.CODE_DIGITS
+
+        win = tk.Toplevel(self.root)
+        win.title("CT Monitor — Login" if startup else "CT Monitor — Masuk Dev Mode")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        if not startup:
+            win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+
+        frm = ttk.Frame(win, padding=16)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="Kode akses diperlukan",
+                  font=("Arial", 12, "bold")).pack(anchor="w")
+        ident_lbl = ttk.Label(frm, text="")
+        ident_lbl.pack(anchor="w", pady=(4, 0))
+        ttk.Label(frm, text=f"Masukkan kode {n_digits} karakter dari FA Key Generator:").pack(
+            anchor="w", pady=(8, 4))
+        code_var = tk.StringVar()
+        entry = ttk.Entry(frm, textvariable=code_var, width=10, justify="center",
+                          font=("Consolas", 20, "bold"))
+        entry.pack()
+        msg = ttk.Label(frm, text="", foreground="#c62828", wraplength=300)
+        msg.pack(anchor="w", pady=(6, 0))
+        info = ttk.Label(frm, text="", foreground="#666666")
+        info.pack(anchor="w", pady=(6, 0))
+        btn = ttk.Button(frm, text="Login")
+        btn.pack(fill="x", pady=(10, 0), ipady=3)
+        cur = self._startup_mode if startup else self._mode
+        ttk.Separator(frm, orient="horizontal").pack(fill="x", pady=(12, 8))
+        ttk.Label(frm, text=f"{cur}-mode",
+                  foreground="#2e7d32" if cur == "production" else "#ef6c00",
+                  font=("Arial", 11, "bold")).pack()
+        if startup and cur == "production":
+            def _start():
+                result["start"] = True
+                result["ok"] = True
+                win.destroy()
+            ttk.Button(frm, text="▶  START", command=_start).pack(
+                fill="x", pady=(6, 0), ipady=4)
+        elif startup:
+            ttk.Label(frm, text="Dev mode: tombol START tidak tersedia.",
+                      foreground="#777777").pack(pady=(4, 0))
+        def _digits() -> str:
+            return "".join(ch for ch in code_var.get() if ch.isalnum()).upper()
+
+        def _submit(event=None):
+            digits = _digits()
+            if not digits or fd_auth.lock_left() > 0:
+                return
+            if len(digits) != n_digits:
+                msg.config(text=f"Kode harus {n_digits} karakter.")
+                return
+            status = fd_auth.attempt(digits)
+            code_var.set("")
+            if status == "ok":
+                result["ok"] = True
+                logger.info("[Auth] Login berhasil")
+                win.destroy()
+            elif status == "no_key":
+                msg.config(text="File kunci stasiun (fa_station.fakey) tidak ditemukan "
+                                "atau tidak valid. Hubungi admin.")
+                logger.error("[Auth] .fakey tidak ada/tidak valid")
+            elif status == "invalid":
+                logger.warning("[Auth] Kode salah")
+                if fd_auth.lock_left() == 0:
+                    msg.config(text=f"Kode salah. Sisa percobaan: {fd_auth.fails_left()}.")
+
+        def _on_change(*_):
+            cur = code_var.get()
+            if cur != cur.upper():
+                code_var.set(cur.upper())      # tampil huruf besar; trace jalan lagi
+                return
+            if len(_digits()) == n_digits:
+                win.after(50, _submit)
+
+        def _tick():
+            if not win.winfo_exists():
+                return
+            line, station = self._auth_identity()
+            ident_lbl.config(
+                text=f"Stasiun: Line {line} / Station {station}"
+                if (line and station) else "Stasiun: belum diketahui")
+            info.config(text=f"Server: {self._var_server.get()}   |   "
+                             f"Jam FD: {time.strftime('%H:%M:%S', time.gmtime())} UTC")
+            left = fd_auth.lock_left()
+            if left > 0:
+                msg.config(text=f"Terlalu banyak percobaan. Coba lagi dalam {left} detik.")
+                btn.config(state="disabled")
+                entry.config(state="disabled")
+            elif str(btn.cget("state")) == "disabled":
+                btn.config(state="normal")
+                entry.config(state="normal")
+                msg.config(text="")
+                entry.focus_set()
+            win.after(500, _tick)
+
+        btn.config(command=_submit)
+        entry.bind("<Return>", _submit)
+        code_var.trace_add("write", _on_change)
+
+        win.update_idletasks()
+        x = (win.winfo_screenwidth() - win.winfo_reqwidth()) // 2
+        y = (win.winfo_screenheight() - win.winfo_reqheight()) // 3
+        win.geometry(f"+{x}+{y}")
+        win.lift()
+        win.focus_force()
+        entry.focus_set()
+        win.grab_set()
+        _tick()
+        win.wait_window()
+
+        if result["ok"] and startup:
+            self.root.deiconify()
+        self._login_start = bool(result["start"])
+        return result["ok"]
+    # ──────────────────────────────────────────────────────────────────────
+    #  Setup persistence (auto save / restore)
+    # ──────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _var_int(var, default):
+        try:
+            return int(var.get())
+        except (tk.TclError, ValueError):
+            return default
+
+    def _save_setup(self):
+        try:
+            old = json.loads(SETUP_PATH.read_text(encoding="utf-8"))
+            if not isinstance(old, dict):
+                old = {}
+        except Exception:
+            old = {}
+
+        # Kalau model belum di-load, pertahankan daftar class yang sebelumnya dimatikan
+        if self._class_vars:
+            disabled = sorted(l for l, v in self._class_vars.items() if not v.get())
+        else:
+            disabled = sorted(self._saved_disabled_classes)
+        self._saved_disabled_classes = set(disabled)
+
+        state = {
+            **old,
+            "version": 3,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "logic_path": str(self._logic_path),
+            "width": self._var_int(self.width, 640),
+            "height": self._var_int(self.height, 480),
+            "fps": self._var_int(self.fps, 24),
+            "format": self.format_var.get(),
+            "mirror": bool(self.mirror_var.get()),
+            "conf": round(float(self.conf_var.get()), 2),
+            "disabled_classes": disabled,
+            "output_dir": self.output_dir,
+            "debug": bool(self._debug_var.get()),
+        }
+        try:
+            SETUP_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = SETUP_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            os.replace(tmp, SETUP_PATH)
+            self.root_status.config(text="Setup disimpan (model, logic, kamera, YOLO, folder)")
+            logger.info(f"[Setup] Disimpan ke {SETUP_PATH}")
+        except Exception as e:
+            logger.error(f"[Setup] Gagal simpan: {e}")
+            messagebox.showerror("Save Setup", str(e))
+
+    def _restore_setup(self):
+        try:
+            d = json.loads(SETUP_PATH.read_text(encoding="utf-8"))
+            if not isinstance(d, dict):
+                return
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            logger.warning(f"[Setup] File setup rusak, diabaikan: {e}")
+            return
+        if d.get("mode") in ("dev", "production"):
+            self._startup_mode = d["mode"]
+        # File XML logic (dimuat sebelum _init_logic_engine dipanggil)
+        lp = d.get("logic_path")
+        if lp and Path(lp) != self._logic_path:
+            p = Path(lp)
+            if p.exists():
+                try:
+                    self._logic_config = load_logic_xml(p)
+                    self._logic_path = p
+                    self._var_logic_file.set(p.name)
+                except (OSError, ET.ParseError, ValueError, TypeError) as e:
+                    logger.warning(f"[Setup] Logic XML {p} gagal dimuat: {e}")
+            else:
+                logger.warning(f"[Setup] Logic XML tidak ditemukan: {p}")
+
+        # Resolusi / format
+        for key, var in (("width", self.width), ("height", self.height), ("fps", self.fps)):
+            v = d.get(key)
+            if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+                var.set(v)
+        if d.get("format") in ("mp4 (H.264)", "mp4 (H.265)"):
+            self.format_var.set(d["format"])
+        if isinstance(d.get("mirror"), bool):
+            self.mirror_var.set(d["mirror"])
+
+        # YOLO
+        c = d.get("conf")
+        if isinstance(c, (int, float)) and not isinstance(c, bool):
+            self.conf_var.set(max(0.01, min(1.0, float(c))))
+            self._on_conf_change()
+        dc = d.get("disabled_classes")
+        if isinstance(dc, list):
+            self._saved_disabled_classes = {str(x) for x in dc}
+        if isinstance(d.get("debug"), bool) and not getattr(self.args, "nondebug", False):
+            self._debug_var.set(d["debug"])
+            self._toggle_debug()
+        # Folder output
+        od = d.get("output_dir")
+        if od and os.path.isdir(od) and os.access(od, os.W_OK):
+            self.output_dir = od
+            self.folder_var.set(od)
+        logger.info("[Setup] Dipulihkan dari setup_state.json")
+
+    def _build_panel_logic(self, parent):
+        box = ttk.LabelFrame(parent, text="Logic ROI", padding=8)
+        box.pack(fill="x", pady=(0, 6))
+        ttk.Label(box, text="File:", foreground="#777777").pack(anchor="w")
+        ttk.Label(box, textvariable=self._var_logic_file, wraplength=260,
+                  foreground="#777777").pack(anchor="w")
+        ttk.Button(box, text="📂  Pilih file XML...",
+                   command=self._browse_logic).pack(fill="x", pady=(4, 6))
+        ttk.Label(box, textvariable=self._var_logic, wraplength=260).pack(
+            anchor="w", pady=(2, 6))
+        ttk.Button(box, text="✏  Edit ROI (Logic Editor)",
+                   command=self._enter_roi_editor).pack(fill="x", pady=(0, 6), ipady=3)
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=(0, 6))
+        ttk.Label(row, text="Siklus:").pack(side="left")
+        ttk.Label(row, textvariable=self.cycle_var,
+                  font=("Consolas", 14, "bold")).pack(side="left", padx=(8, 0))
+        ttk.Button(box, text="🔄  Muat ulang XML", command=self._reload_logic).pack(
+            fill="x", pady=(0, 4))
+        ttk.Button(box, text="Reset Count", command=self._reset_count).pack(
+            fill="x", pady=(0, 4))
+        ttk.Button(box, text="📦  Simpan sebagai Preset...",
+                   command=self._save_preset).pack(fill="x", pady=(0, 4))
+        ttk.Button(box, text="💾  Save Setup", command=self._save_setup).pack(fill="x")
+    def _browse_logic(self):
+        if self._roi_editor is not None:
+            messagebox.showinfo("Logic", "Tutup Logic Editor dulu sebelum mengganti file XML.")
+            return
+        path = filedialog.askopenfilename(
+            title="Pilih file XML ROI (logic config)",
+            initialdir=str(self._logic_path.parent),
+            filetypes=[("XML", "*.xml"), ("All", "*.*")],
+        )
+        if not path:
+            return
+        new_path = Path(path)
+        try:
+            cfg = load_logic_xml(new_path)
+        except (OSError, ET.ParseError, ValueError, TypeError) as e:
+            messagebox.showerror("Logic", f"Gagal membaca {new_path.name}:\n{e}")
+            return
+        errors, _warnings = validate_logic(cfg)
+        if errors:
+            messagebox.showerror("Logic", f"{new_path.name} tidak valid:\n" + "\n".join(errors))
+            return
+
+        # Siklus yang sedang berjalan tidak valid lagi untuk config baru
+        self.yolo.engine.abort_cycle()
+        if self._ct_recorder:
+            self._ct_recorder.discard()
+        self._var_elapsed.set("—")
+        self._set_cycle_state("IDLE")
+
+        self._logic_path = new_path
+        self._var_logic_file.set(new_path.name)
+        self._logic_config = cfg
+        self._init_logic_engine()
+        logger.info(f"[Logic] File XML diganti ke {new_path}")
+    def _on_logic_saved(self, p):
+        """Dipanggil editor setelah Simpan / Simpan Sebagai: jadikan file itu config aktif."""
+        p = Path(p)
+        self._logic_path = p
+        self._var_logic_file.set(p.name)
+        self._reload_logic()
+    def _reload_logic(self):
+        try:
+            cfg = load_logic_xml(self._logic_path)
+        except (OSError, ET.ParseError, ValueError, TypeError) as e:
+            messagebox.showerror("Logic", f"Gagal membaca {self._logic_path.name}:\n{e}")
+            return
+        self._logic_config = cfg
+        self._init_logic_engine()
+
+    def _enter_roi_editor(self):
+        if self._roi_editor is not None:
+            return
+        if not self.running:
+            self.start_camera()
+        # Hentikan logika produksi selama ROI diedit
+        self.yolo.engine_enabled = False
+        self.yolo.engine.abort_cycle()
+        if self._ct_recorder:
+            self._ct_recorder.discard()
+        self._var_elapsed.set("—")
+        self._set_cycle_state("IDLE")
+
+        self._ctrl_canvas.pack_forget()
+        self._ctrl_scrollbar.pack_forget()
+        self._mode_before_editor = self._view_mode
+        self._view_mode = "single"
+        self._view_mode_var.set("single")
+        panel = LogicEditorPanel(
+            self._ctrl_outer, self.preview,
+            get_frame_size=lambda: self.hub.size(self._view_slot),
+            get_class_names=lambda: self.yolo.get_class_names(self._view_slot),
+            get_mirror=lambda: self.mirror_var.get(),
+            get_default_conf=lambda: self.conf_var.get(),
+            xml_path=self._logic_path,
+            on_saved=self._on_logic_saved,
+            on_close=lambda: self.root.after(0, self._exit_roi_editor),
+            set_status=lambda t: self.root_status.config(text=t),
+            get_live=self.yolo.engine.monitor_snapshot,
+            on_select_source=self._on_editor_select_slot,
+            on_sources_changed=self._sync_sources,
+            
+        )
+        panel.pack(fill="both", expand=True)
+        panel.attach()
+        self._roi_editor = panel
+        self.root_status.config(
+            text="Edit ROI — tekan P untuk membekukan preview sebelum menggambar")
+    def _on_editor_select_slot(self, slot):
+        self._view_slot = slot
+        self._view_combo.set(f"S{slot}")
+    def _exit_roi_editor(self):
+        panel = self._roi_editor
+        if panel is None:
+            return
+        self._roi_editor = None
+        self._logic_path = Path(panel.xml_path)       # file terakhir yang dipakai editor
+        self._var_logic_file.set(self._logic_path.name)
+        self._view_mode_var.set(self._mode_before_editor)
+        self._on_view_mode()
+        try:
+            panel.detach()
+        finally:
+            panel.destroy()
+        self.preview.config(cursor="")
+        self._ctrl_scrollbar.pack(side="right", fill="y")
+        self._ctrl_canvas.pack(side="left", fill="both", expand=True)
+        self._reload_logic()
+        self.yolo.engine_enabled = True
+        self.root_status.config(text="Edit ROI ditutup — logika produksi aktif lagi")
+    def _reset_count(self):
+        self.yolo.reset_counts()
+        if self._ct_recorder:
+            self._ct_recorder.discard()
+        self.cycle_var.set("0")
+        self._var_cycle.set("0")
+
+    def _init_logic_engine(self):
+        cfg = self._logic_config
+        if cfg is None:
+            self._var_logic.set("TIDAK ADA / RUSAK")
+            self.root_status.config(
+                text=f"{self._logic_path.name} tidak ada/rusak — buat dulu dengan logic_editor")
+            return
+        errors, warnings = validate_logic(cfg)
+        for w in warnings:
+            logger.warning(f"[Logic] {w}")
+        if errors:
+            for e in errors:
+                logger.error(f"[Logic] {e}")
+            self._var_logic.set("TIDAK VALID — lihat log")
+            self.root_status.config(text=f"{self._logic_path.name} tidak valid - lihat log")
+            return
+        self.yolo.engine.set_config(cfg)
+        self._adapted.clear()
+        if self.running:
+            self._sync_sources(retry=True)      # Muat ulang XML = coba lagi model yang gagal
+        lowest = max(0.01, int(min(r.conf for r in cfg.all_rois()) * 100) / 100)
+        self._roi_min_conf = lowest
+        self._on_conf_change()
+        n = len(cfg.sequence)
+        self._var_logic.set(f"{n} sequence ROI | dimuat {datetime.now():%H:%M:%S}")
+        logger.info(f"[Logic] Engine aktif: {n} sequence ROI")
+        self.root_status.config(text=f"Logic dimuat: {n} sequence ROI")
+        if self._logic_path.parent == PRESET_DIR:
+            self._var_preset.set(self._logic_path.stem)
+    # ──────────────────────────────────────────────────────────────────────
+    #  Cycle callbacks
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _anomaly_limit(self) -> float:
+        if self._takt:
+            return self._takt.anomaly_timer
+        return float(self._cfg.get("ANOMALY_TIMER", 20.0))
+
+    def _discard_limit(self) -> float:
+        if self._takt:
+            return self._takt.discard_timeout
+        return float(self._cfg.get("DISCARD_TIMEOUT", 300.0))
+    def _min_cycle_limit(self) -> float:
+        if self._takt:
+            return self._takt.min_cycle
+        return float(self._cfg.get("MIN_CYCLE_TIME", 3.0))
+    def _short_limit(self) -> float:
+        if self._takt and self._takt.short_limit is not None:
+            return self._takt.short_limit
+        return float(self._cfg.get("SHORT_ANOMALY_LIMIT", 0.0))
+
+    def _classify_cycle(self, ct: float) -> str:
+        """Return 'SHORT', 'LONG', atau 'OK'. (< min CT sudah dibuang di tracker)"""
+        short = self._short_limit()
+        if short > 0 and ct < short:
+            return "SHORT"
+        if ct > self._anomaly_limit():
+            return "LONG"
+        return "OK"
+    @staticmethod
+    def _anomaly_label(anom_type: str, skipped: list) -> str:
+        """OK  |  Anomaly+long  |  Anomaly+expected+LCD  |  Anomaly+long+expected+LCD"""
+        parts = []
+        if anom_type == "LONG":
+            parts.append("long")
+        elif anom_type == "SHORT":
+            parts.append("short")
+        if skipped:
+            parts += ["expected", ", ".join(d for _, d in skipped)]
+        return "Anomaly+" + "+".join(parts) if parts else "OK"
+    def _on_cycle_rejected(self, elapsed: float, min_ct: float):
+        """Dipanggil dari thread YOLO — semua yang menyentuh Tk lewat self._ui()."""
+        logger.warning(f"[Filter] Siklus {elapsed:.2f}s < min {min_ct:.1f}s — dibuang")
+        self._logger.log("DISCARD", f"cycle terlalu cepat {elapsed:.2f}s < {min_ct:.1f}s")
+        if self._ct_recorder:
+            self._ct_recorder.discard()
+        self._ui(
+            lambda: self._enter_discard(
+                f"siklus {elapsed:.1f}s < minimum {min_ct:.1f}s", hold=2.0
+            )
+        )
+    def _on_cycle_start(self, ts=None):
+        if self._ct_recorder and not self.args.no_record:
+            slots, sizes = self.hub.slots(), self.hub.sizes()
+            cell = self._cell or rec_cell(sizes, slots)
+            self._ct_recorder.start_cycle(
+                ts or time.time(), layout=layout_meta(slots, cell, sizes=sizes))
+        logger.info("[Cycle] START")
+
+    def _on_cycle_complete(self, cycle_num, start_ts, end_ts, cycle_time,
+                           is_genesis=False, skipped=None):
+        skipped = skipped or []
+        if skipped:
+            logger.warning("[Cycle] #%d expected terlewat: %s", cycle_num,
+                           ", ".join(f"{i} ({d})" for i, d in skipped))
+        anom_type = self._classify_cycle(cycle_time)
+        label = "GENESIS" if is_genesis else ""
+        video_info = None
+        if self._ct_recorder and not self.args.no_record:
+            base_url = self.args.endpoint.replace("/api/cycle", "")
+            video_info = self._ct_recorder.stop_cycle(
+                cycle_time_sec=cycle_time,
+                takt_time=self._takt.value if self._takt else None,
+                anomaly_type=anom_type,
+                update_url=f"{base_url}/api/video/update-size",
+                end_ts=end_ts,
+                label=label,
+                skipped=skipped,
+                anomaly_label=self._anomaly_label(anom_type, skipped),
+            )
+        threading.Thread(
+            target=self._handle_cycle_complete,
+            args=(cycle_num, start_ts, end_ts, cycle_time, anom_type,
+                  video_info, is_genesis, skipped),
+            daemon=True,
+        ).start()
+
+    def _handle_cycle_complete(self, cycle_num, start_ts, end_ts, cycle_time,
+                            anom_type, video_info, is_genesis=False, skipped=None):
+        skipped = skipped or []
+        label = self._anomaly_label(anom_type, skipped)
+        logger.info(f"[Cycle] Complete #{cycle_num} | ct={cycle_time:.2f}s | {label}")
+        try:
+            is_anom = anom_type != "OK" or bool(skipped)
+            try:
+                self._storage.append_summary({
+                    "line": self.args.line,
+                    "station_id": self.args.station,
+                    "operator_id": self.args.operator or "",
+                    "cycle_time_sec": round(cycle_time, 3),
+                    "start_timestamp": start_ts,
+                    "end_timestamp": end_ts,
+                    "is_complete": 1,
+                    "is_anomaly": int(is_anom),
+                    "cycle_count": cycle_num,
+                    "video_filename": (video_info or {}).get("filename", ""),
+                    "anomaly_type": anom_type,
+                    "is_genesis": int(is_genesis),
+                    "anomaly_label": label,
+                    "skipped_expected": "; ".join(d for _, d in skipped),
+                })
+            except Exception as e:
+                logger.error(f"[Summary] gagal tulis CSV: {e}")
+            if self._takt:
+                self._takt.refresh()
+
+            if self._reporter:
+                self._reporter.record(
+                    cycle_num, start_ts, end_ts, cycle_time,
+                    anom_type, is_genesis, label,
+                )
+
+            # Kirim ke server (video_info sudah dibuat di _on_cycle_complete)
+            if self._sender:
+                from cycle_tracker import CycleResult
+
+                result = CycleResult(
+                    cycle_id=cycle_num,
+                    station_id=self.args.station,
+                    start_timestamp=start_ts,
+                    end_timestamp=end_ts,
+                    cycle_time_sec=cycle_time,
+                    takt_time_s=self._takt.value if self._takt else 0,
+                    is_complete=True,
+                    anomaly=is_anom,
+                    completion_count=cycle_num,
+                    operator_id=self.args.operator,
+                    anomaly_type=anom_type,
+                    label="GENESIS" if is_genesis else "",
+                    is_genesis=is_genesis,
+                )
+                if video_info:
+                    result.anomaly = video_info.get("is_anomaly", is_anom)
+                self._sender.send(
+                    result,
+                    video_info=video_info,
+                    extra={
+                        "is_anomaly": is_anom,
+                        "anomaly_label": label,
+                        "skipped_expected": [
+                            {"id": i, "description": d} for i, d in skipped
+                        ],
+                    },
+                )
+
+            self._ui(
+                lambda: self._on_cycle_ui_update(
+                    cycle_num, cycle_time, anom_type, is_genesis, skipped, label)
+            )
+            self._ui(self._show_complete)
+            self._ui(
+                lambda: self.cycle_var.set(f"{cycle_num}  ({cycle_time:.1f}s)")
+            )
+
+        except Exception as e:
+            logger.error(f"[Cycle] _handle_cycle_complete ERROR: {e}", exc_info=True)
+
+    def _attach_cycle_callbacks(self):
+        t = self.yolo._tracker
+        if t:
+            t.on_cycle_start = self._on_cycle_start
+            t.on_cycle_complete = self._on_cycle_complete
+            t.on_cycle_rejected = self._on_cycle_rejected
+            t.min_cycle_getter = self._min_cycle_limit
+    def _check_timers(self):
+        tracker = self.yolo._tracker
+        if not tracker or not tracker.is_cycle_active():
+            self._elapsed_label.config(foreground="")
+            return
+
+        anomaly_lim = self._anomaly_limit()
+        discard_lim = self._discard_limit()
+        grace = float(self._cfg.get("TRANSIT_GRACE", 3.0))
+
+        # Timer discard: last ROI time + setpoint
+        idle = tracker.seconds_since_roi()
+        if idle >= discard_lim:
+            self._on_discard_timeout(idle)
+            return
+
+        # Timer anomaly: elapsed sejak ROI 1, merah jika lewat batas
+        elapsed = tracker.cycle_elapsed()
+
+        # Pastikan nilai timer UI selalu diperbarui selama cycle aktif
+        if elapsed >= 0:
+            self._var_elapsed.set(f"{elapsed:.1f}s")
+        self._elapsed_label.config(
+            foreground="#c62828" if elapsed > anomaly_lim else ""
+        )
+        # State: tahan COMPLETE beberapa detik
+        if time.time() < self._hold_state_until:
+            return
+
+        want = "TRANSIT" if idle >= grace else "RUNNING"
+        if self._var_state.get() != want:
+            self._set_cycle_state(want)
+
+        if want == "TRANSIT":
+            self.root_status.config(
+                text=f"TRANSIT {idle:.0f}s — timeout dalam {discard_lim - idle:.0f}s"
+            )
+    def _enter_discard(self, reason: str, hold: float = 0.0):
+        """Set state DISCARD (dikirim ke server), lalu kembali IDLE setelah 3 detik."""
+        self._hold_state_until = time.time() + hold if hold > 0 else 0.0
+        self._set_cycle_state("DISCARD")
+        self._var_elapsed.set("—")
+        self.root_status.config(text=f"Siklus dibuang — {reason}")
+        self.root.after(
+            3000,
+            lambda: self._set_cycle_state("IDLE")
+            if self._var_state.get() == "DISCARD" else None,
+        )
+    def _on_discard_timeout(self, idle: float):
+        logger.warning(f"[Discard] {idle:.0f}s tanpa ROI — video dibuang")
+        self._logger.log("DISCARD", f"timeout idle {idle:.0f}s")
+        if self.yolo._tracker:
+            self.yolo._tracker.abort_cycle()
+        if self._ct_recorder:
+            self._ct_recorder.discard()
+        self._enter_discard(f"timeout {idle:.0f}s, operator meninggalkan station")
+    def _on_cycle_aborted(self, reason: str):
+        logger.warning(f"[Discard] ABORT: {reason} — video dibuang")
+        self._logger.log("DISCARD", reason)
+        if self._ct_recorder:
+            self._ct_recorder.discard()
+        self._ui(lambda: self._enter_discard(reason))
+    def _show_complete(self):
+        self._hold_state_until = time.time() + 2.0
+        self._set_cycle_state("COMPLETE")
+    # ──────────────────────────────────────────────────────────────────────
+    #  UI Builder
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+
+        pad = 4 if self._compact else 10
+        ctrl_w = 270 if self._compact else 300
+        main = ttk.Frame(self.root, padding=pad)
+        main.grid(row=0, column=0, sticky="nsew")
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(0, weight=1)
+
+        # Preview
+        preview_outer = ttk.LabelFrame(
+            main, text="Live Preview", padding=5
+        )
+        preview_outer.grid(row=0, column=0, sticky="nsew", padx=(0, pad))
+        preview_outer.rowconfigure(0, weight=1)
+        preview_outer.columnconfigure(0, weight=1)
+
+        self._preview_container = tk.Frame(preview_outer, bg="black", width=1, height=1)
+        self._preview_container.grid(row=0, column=0, sticky="nsew")
+        self._preview_container.pack_propagate(False)
+        self._preview_container.grid_propagate(False)
+
+        self._tile_sb = ttk.Scrollbar(preview_outer, orient="vertical",
+                                      command=self._on_tile_sbar)
+        self._tile_sb.grid(row=0, column=1, sticky="ns")
+        self._tile_sb.grid_remove()
+
+        self.preview = tk.Label(
+            self._preview_container,
+            text="Camera Preview",
+            bg="black",
+            fg="white",
+            font=("Arial", 18),
+        )
+        self.preview.pack(fill="both", expand=True)
+        self.preview.bind("<MouseWheel>", self._on_tile_wheel)
+        self.preview.bind("<Button-4>", self._on_tile_wheel)   # Linux
+        self.preview.bind("<Button-5>", self._on_tile_wheel)
+        self.roi_view = ROIViewer(lambda: self.yolo.engine, lambda: self._view_slot)
+
+        # Control panel (scrollable)
+        ctrl_outer = tk.Frame(main)
+        ctrl_outer.grid(row=0, column=1, sticky="nsew")
+        main.columnconfigure(1, minsize=0, weight=0)
+        ctrl_canvas = tk.Canvas(ctrl_outer, highlightthickness=0, width=1)
+
+        def _fit_ctrl(e):
+            # lebar panel kontrol = 30% window, maksimal ctrl_w, boleh sampai 0
+            ctrl_canvas.config(width=max(0, min(ctrl_w, int(e.width * 0.3))))
+        main.bind("<Configure>", _fit_ctrl)
+        ctrl_scrollbar = ttk.Scrollbar(
+            ctrl_outer, orient="vertical", command=ctrl_canvas.yview
+        )
+        ctrl_canvas.configure(yscrollcommand=ctrl_scrollbar.set)
+        ctrl_scrollbar.pack(side="right", fill="y")
+        ctrl_canvas.pack(side="left", fill="both", expand=True)
+        self._ctrl_outer = ctrl_outer
+        self._ctrl_scrollbar = ctrl_scrollbar
+        control = ttk.Frame(ctrl_canvas)
+        _win = ctrl_canvas.create_window((0, 0), window=control, anchor="nw")
+        self._ctrl_canvas = ctrl_canvas
+        self._ctrl_frame = control
+
+        def _on_ctrl_resize(e):
+            ctrl_canvas.configure(scrollregion=ctrl_canvas.bbox("all"))
+            ctrl_canvas.itemconfig(_win, width=ctrl_canvas.winfo_width())
+
+        def _on_canvas_resize(e):
+            ctrl_canvas.itemconfig(_win, width=e.width)
+
+        def _on_mousewheel(e):
+            ctrl_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+        control.bind("<Configure>", _on_ctrl_resize)
+        ctrl_canvas.bind("<Configure>", _on_canvas_resize)
+        ctrl_canvas.bind("<MouseWheel>", _on_mousewheel)
+        control.bind("<MouseWheel>", _on_mousewheel)
+
+        # Tombol mode (paling atas)
+        self._build_panel_mode(control)
+        self._build_panel_tampilan(control)
+        # Panel yang selalu tampil (production + setting)
+        self._build_panel_stasiun(control)
+        self._build_panel_produksi(control)
+        self._build_panel_cycle_time(control)
+        self._build_panel_sysmon(control)
+        # Panel khusus setting mode
+        self._setting_frame = ttk.Frame(control)
+        self._setting_frame.pack(fill="x")
+        sf = self._setting_frame
+        self._build_panel_camera(sf)
+        self._build_panel_yolo(sf)
+        self._build_panel_logic(sf)
+        self._build_panel_capture(sf)
+        self._build_panel_server(sf)
+        self._build_panel_storage(sf)
+        self._build_panel_status(sf)
+
+        self.root_status = ttk.Label(
+            self.root, text="Ready", relief="sunken", anchor="w", padding=4
+        )
+        self.root_status.grid(row=1, column=0, sticky="ew")
+        self._set_mode(self._mode)
+        self._bind_mouse_scroll()
+
+    # ── Panel: STASIUN ────────────────────────────────────────────────────
+    def _build_panel_mode(self, parent):
+        box = ttk.LabelFrame(parent, text="MODE", padding=8)
+        box.pack(fill="x", pady=(0, 6))
+        row = ttk.Frame(box)
+        row.pack(fill="x")
+        ttk.Label(row, text="Current mode", width=12, anchor="w").pack(side="left")
+        self._mode_label = ttk.Label(row, text="—", font=("Consolas", 11, "bold"))
+        self._mode_label.pack(side="left")
+        self._mode_btn = ttk.Button(box, text="🔒  Ganti mode (login)",
+                                    command=self._on_mode_button)
+        crow = ttk.Frame(box)
+        crow.pack(fill="x", pady=(2, 0))
+        ttk.Label(crow, text="Config", width=12, anchor="w").pack(side="left")
+        ttk.Label(crow, textvariable=self._var_active_cfg,
+                  font=("Consolas", 10, "bold"), wraplength=170).pack(side="left")
+        # ── Quick preset (tanpa login) ──
+        prow = ttk.Frame(box)
+        prow.pack(fill="x", pady=(4, 0))
+        ttk.Label(prow, text="Preset", width=12, anchor="w").pack(side="left")
+        self._preset_combo = ttk.Combobox(
+            prow, textvariable=self._var_preset, state="readonly", width=18,
+            values=self._list_presets(), postcommand=self._refresh_presets)
+        self._preset_combo.pack(side="left", fill="x", expand=True)
+        self._preset_combo.bind("<<ComboboxSelected>>", self._on_preset_pick)
+        self._mode_btn.pack(fill="x", pady=(6, 0), ipady=3)
+
+    def _save_mode(self, mode: str):
+        try:
+            old = json.loads(SETUP_PATH.read_text(encoding="utf-8"))
+            if not isinstance(old, dict):
+                old = {}
+        except Exception:
+            old = {}
+        old["mode"] = mode
+        try:
+            SETUP_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = SETUP_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(old, indent=2), encoding="utf-8")
+            os.replace(tmp, SETUP_PATH)
+            logger.info(f"[Mode] Disimpan: {mode}")
+        except Exception as e:
+            logger.error(f"[Mode] Gagal simpan: {e}")
+    # ──────────────────────────────────────────────────────────────────────
+    #  Preset setup (model + XML) — load tanpa login, save di Dev Mode
+    # ──────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _list_presets() -> list:
+        try:
+            PRESET_DIR.mkdir(parents=True, exist_ok=True)
+            return sorted(p.stem for p in PRESET_DIR.glob("*.xml"))
+        except OSError:
+            return []
+
+    def _refresh_presets(self):
+        """Dipanggil tiap dropdown dibuka, jadi file baru langsung muncul."""
+        self._preset_combo.config(values=self._list_presets())
+
+    def _patch_setup(self, **kw):
+        try:
+            old = json.loads(SETUP_PATH.read_text(encoding="utf-8"))
+            if not isinstance(old, dict):
+                old = {}
+        except Exception:
+            old = {}
+        old.update(kw)
+        try:
+            SETUP_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = SETUP_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(old, indent=2), encoding="utf-8")
+            os.replace(tmp, SETUP_PATH)
+        except Exception as e:
+            logger.error(f"[Setup] Gagal simpan: {e}")
+
+    def _apply_logic_file(self, p: Path) -> bool:
+        """Validasi lalu terapkan XML (+ model per source). True bila berhasil."""
+        try:
+            cfg = load_logic_xml(p)
+        except (OSError, ET.ParseError, ValueError, TypeError) as e:
+            messagebox.showerror("Preset", f"Gagal membaca {p.name}:\n{e}")
+            return False
+        errors, _ = validate_logic(cfg)
+        if errors:
+            messagebox.showerror("Preset", f"{p.name} tidak valid:\n" + "\n".join(errors))
+            return False
+        missing = [s.model for s in cfg.sources.values()
+                if (s.model or "").strip() and not Path(s.model).exists()]
+        if missing:
+            messagebox.showerror("Preset", "File model tidak ditemukan:\n" + "\n".join(missing))
+            return False
+
+        # siklus berjalan tidak valid untuk config baru
+        self.yolo.engine.abort_cycle()
+        if self._ct_recorder:
+            self._ct_recorder.discard()
+        self._var_elapsed.set("—")
+        self._set_cycle_state("IDLE")
+
+        self._logic_path = p
+        self._var_logic_file.set(p.name)
+        self._logic_config = cfg
+        self._init_logic_engine()                 # set ROI + assign model + sync source
+        if self._mode == "production":
+            if not self.running:
+                self.start_camera()
+            self.yolo.enabled = True
+            self._update_model_info()
+        self._var_active_cfg.set(p.name)
+        self._patch_setup(logic_path=str(p))      # START berikutnya memakai config ini
+        logger.info(f"[Preset] Dimuat: {p}")
+        return True
+
+    def _on_preset_pick(self, _=None):
+        name = self._var_preset.get()
+        if not name:
+            return
+        if self._roi_editor is not None:
+            messagebox.showinfo("Preset", "Tutup Logic Editor dulu sebelum ganti preset.")
+            return
+        p = PRESET_DIR / f"{name}.xml"
+        if not p.exists():
+            messagebox.showerror("Preset", f"File tidak ditemukan:\n{p}")
+            self._refresh_presets()
+            return
+        if self.yolo.engine.is_cycle_active():
+            if not messagebox.askyesno(
+                    "Preset", "Siklus sedang berjalan dan akan dibuang. Lanjut ganti preset?"):
+                cur = self._var_active_cfg.get()
+                self._var_preset.set(cur.removesuffix(".xml") if cur != "—" else "")
+                return
+        if self._apply_logic_file(p):
+            self.root_status.config(text=f"Preset dimuat: {name}")
+        else:
+            self._var_preset.set("")
+
+    def _save_preset(self):
+        """Salin XML aktif ke setup-model/<nama>.xml (hanya ada di panel Dev)."""
+        if self._roi_editor is not None:
+            messagebox.showinfo("Preset", "Simpan dulu perubahan di Logic Editor, lalu tutup editor.")
+            return
+        if not self._logic_path.exists():
+            messagebox.showerror("Preset", "File XML aktif tidak ditemukan.")
+            return
+        name = simpledialog.askstring(
+            "Simpan Preset", "Nama preset:", initialvalue=self._logic_path.stem,
+            parent=self.root)
+        if not name:
+            return
+        name = re.sub(r"[^\w\- ]", "_", name.strip()).strip()
+        if not name:
+            return
+        PRESET_DIR.mkdir(parents=True, exist_ok=True)
+        dst = PRESET_DIR / f"{name}.xml"
+        if dst.exists() and dst.resolve() != self._logic_path.resolve():
+            if not messagebox.askyesno("Preset", f"'{name}' sudah ada. Timpa?"):
+                return
+        try:
+            if not (dst.exists() and dst.resolve() == self._logic_path.resolve()):
+                shutil.copy2(self._logic_path, dst)
+        except OSError as e:
+            messagebox.showerror("Preset", f"Gagal menyimpan:\n{e}")
+            return
+        self._refresh_presets()
+        self._var_preset.set(name)
+        self.root_status.config(text=f"Preset disimpan: {dst}")
+        logger.info(f"[Preset] Disimpan: {dst}")
+    def _on_start_production(self):
+        """START: muat XML dari config tersimpan (bukan hardcode), jalankan source + model."""
+        def fail(msg):
+            logger.error(f"[Production] START gagal: {msg}")
+            self.root_status.config(text=f"START gagal: {msg.splitlines()[0]}")
+            messagebox.showerror("START", msg)
+
+        try:
+            d = json.loads(SETUP_PATH.read_text(encoding="utf-8"))
+            lp = d.get("logic_path") if isinstance(d, dict) else None
+        except Exception:
+            lp = None
+        if not lp:
+            fail("Config belum ada.\nMasuk Dev Mode, pilih file XML, lalu klik Save Setup.")
+            return
+        p = Path(lp)
+        if not p.exists():
+            fail(f"File config tidak ditemukan:\n{p}")
+            return
+        try:
+            cfg = load_logic_xml(p)
+        except (OSError, ET.ParseError, ValueError, TypeError) as e:
+            fail(f"Gagal membaca {p.name}:\n{e}")
+            return
+        errors, _warnings = validate_logic(cfg)
+        if errors:
+            fail(f"{p.name} tidak valid:\n" + "\n".join(errors))
+            return
+        missing = [s.model for s in cfg.sources.values()
+                   if (s.model or "").strip() and not Path(s.model).exists()]
+        if missing:
+            fail("File model tidak ditemukan:\n" + "\n".join(missing))
+            return
+
+        # Terapkan config
+        self._logic_path = p
+        self._var_logic_file.set(p.name)
+        self._logic_config = cfg
+        self._init_logic_engine()              # set engine + ROI dari XML ini
+        if not self.running:
+            self.start_camera()                # _sync_sources: buka source + muat model per slot
+        self.yolo.enabled = True               # aktifkan semua slot yang punya model
+        self._update_model_info()
+        self._var_active_cfg.set(p.name)
+        self._var_preset.set(p.stem if p.parent == PRESET_DIR else "")
+        logger.info(f"[Production] START | config={p} | {len(cfg.sources)} source")
+        self.root_status.config(text=f"Production berjalan | config: {p.name}")
+    def _build_panel_stasiun(self, parent):
+        box = ttk.LabelFrame(parent, text="STASIUN", padding=8)
+        box.pack(fill="x", pady=(0, 6))
+
+        def _row(lbl, var):
+            r = ttk.Frame(box)
+            r.pack(fill="x", pady=1)
+            ttk.Label(r, text=lbl, width=12, anchor="w").pack(side="left")
+            ttk.Label(r, textvariable=var, font=("Consolas", 10, "bold")).pack(
+                side="left", fill="x", expand=True, anchor="w"
+            )
+
+        # Semua nilai di bawah ini datang dari response server
+        _row("Station ID", self._var_station)
+        _row("Nama",       self._var_name)
+        _row("Line",       self._var_line)
+        if not self._compact:
+            _row("Hostname", self._var_host)
+            _row("IP",       self._var_ip)
+            _row("Port",     self._var_port)
+
+        op_row = ttk.Frame(box)
+        op_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(op_row, text="Operator", width=12, anchor="w").pack(side="left")
+        self._op_entry = ttk.Entry(op_row, font=("Arial", 10), width=10)
+        self._op_entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        ttk.Button(
+            op_row, text="Set", width=5,
+            command=lambda: self._set_operator(self._op_entry.get()),
+        ).pack(side="left")
+
+    # ── Panel: PRODUKSI ───────────────────────────────────────────────────
+
+    def _build_panel_produksi(self, parent):
+        box = ttk.LabelFrame(parent, text="PRODUKSI", padding=8)
+        box.pack(fill="x", pady=(0, 6))
+
+        def _row(lbl, var, bold=False):
+            f = ttk.Frame(box)
+            f.pack(fill="x", pady=2)
+            ttk.Label(f, text=lbl, width=12, anchor="w").pack(side="left")
+            font = ("Consolas", 11, "bold") if bold else ("Consolas", 10)
+            lb = ttk.Label(f, textvariable=var, font=font)
+            lb.pack(side="left")
+            return lb
+
+        state_row = ttk.Frame(box)
+        state_row.pack(fill="x", pady=2)
+        ttk.Label(state_row, text="State", width=12, anchor="w").pack(side="left")
+        self._state_label = ttk.Label(
+            state_row, textvariable=self._var_state, font=("Consolas", 12, "bold")
+        )
+        self._state_label.pack(side="left")
+        _row("Anomaly (s)", self._var_anom_lim)
+        _row("Discard (s)", self._var_disc_lim)
+        _row("Min CT (s)", self._var_min_lim)
+        _row("Short (s)", self._var_short_lim) 
+        _row("Cycle Count", self._var_cycle, bold=True)
+        _row("Takt Time", self._var_takt)
+        _row("Jam", self._var_clock, bold=True)
+        _row("Shift", self._var_shift)
+        count_row = ttk.Frame(box)
+        count_row.pack(fill="x", pady=(6, 2))
+        ttk.Label(count_row, text="OK", width=4, anchor="w").pack(side="left")
+        ttk.Label(
+            count_row,
+            textvariable=self._var_ok_count,
+            font=("Consolas", 11, "bold"),
+            foreground="#2e7d32",
+        ).pack(side="left")
+        ttk.Label(count_row, text="  ANOM").pack(side="left")
+        ttk.Label(
+            count_row,
+            textvariable=self._var_anom_count,
+            font=("Consolas", 11, "bold"),
+            foreground="#c62828",
+        ).pack(side="left")
+        
+    def _build_panel_cycle_time(self, parent):
+        box = ttk.LabelFrame(parent, text="Cycle Time", padding=8)
+        box.pack(fill="x", pady=(0, 6))
+
+        # 1. Current Cycle (pindahan dari Elapsed)
+        cur = ttk.Frame(box)
+        cur.pack(fill="x", pady=2)
+        ttk.Label(cur, text="Current Cycle", width=14, anchor="w").pack(side="left")
+        self._elapsed_label = ttk.Label(
+            cur, textvariable=self._var_elapsed, font=("Consolas", 14, "bold")
+        )
+        self._elapsed_label.pack(side="left")
+
+        ttk.Separator(box, orient="horizontal").pack(fill="x", pady=6)
+
+        # 2. Last Cycle (besar)
+        ttk.Label(box, text="Last Cycle", anchor="w").pack(fill="x")
+        self._last_ct_label = ttk.Label(
+            box, textvariable=self._var_last_ct,
+            font=("Consolas", 22 if self._compact else 32, "bold"), anchor="center",
+        )
+        self._last_ct_label.pack(fill="x", pady=(0, 4))
+
+        ttk.Separator(box, orient="horizontal").pack(fill="x", pady=6)
+
+        # 3. Statistik tambahan
+        def _row(lbl, var):
+            r = ttk.Frame(box)
+            r.pack(fill="x", pady=1)
+            ttk.Label(r, text=lbl, width=14, anchor="w").pack(side="left")
+            ttk.Label(r, textvariable=var, font=("Consolas", 11, "bold")).pack(side="left")
+
+        _row("Average", self._var_avg_ct)
+
+    def _build_panel_sysmon(self, parent):
+        box = ttk.LabelFrame(parent, text="Sistem", padding=8)
+        box.pack(fill="x", pady=(0, 6))
+        for lbl, var in (("CPU", self._var_cpu), ("CPU app", self._var_proc_cpu),
+                         ("RAM", self._var_ram), ("RAM app", self._var_proc_ram),
+                         ("GPU", self._var_gpu)):
+            r = ttk.Frame(box)
+            r.pack(fill="x", pady=1)
+            ttk.Label(r, text=lbl, width=9, anchor="w").pack(side="left")
+            ttk.Label(r, textvariable=var, font=("Consolas", 10, "bold")).pack(side="left")
+
+    def _sysmon_tick(self):
+        try:
+            s = self.sysmon.snapshot()
+            if s.get("cpu") is not None:
+                self._var_cpu.set(f"{s['cpu']:.0f}%")
+                self._var_proc_cpu.set(f"{s['proc_cpu']:.0f}%")
+                self._var_ram.set(
+                    f"{s['ram_pct']:.0f}%  {s['ram_used_gb']:.1f}/{s['ram_total_gb']:.1f} GB")
+                self._var_proc_ram.set(f"{s['proc_ram_mb']:.0f} MB")
+            else:
+                for v in (self._var_cpu, self._var_proc_cpu, self._var_ram, self._var_proc_ram):
+                    v.set("psutil belum terpasang")
+            g = s.get("gpu")
+            if g:
+                self._var_gpu.set(
+                    f"{g['util']}%  {g['mem_used_mb']:.0f}/{g['mem_total_mb']:.0f} MB  {g['temp']}°C")
+            else:
+                self._var_gpu.set("tidak ada")
+        except Exception as e:
+            logger.error(f"[SysMon] tick error: {e}", exc_info=True)
+        self.root.after(1000, self._sysmon_tick)
+    def _build_panel_tampilan(self, parent):
+        box = ttk.LabelFrame(parent, text="Source & Tampilan", padding=8)
+        box.pack(fill="x", pady=(0, 6))
+
+        self._view_mode_var = tk.StringVar(value="single")
+        mrow = ttk.Frame(box)
+        mrow.grid(row=0, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Label(mrow, text="Preview:").pack(side="left")
+        ttk.Radiobutton(mrow, text="1 source", variable=self._view_mode_var, value="single",
+                        command=self._on_view_mode).pack(side="left", padx=(6, 0))
+        ttk.Radiobutton(mrow, text="Tile", variable=self._view_mode_var, value="tile",
+                        command=self._on_view_mode).pack(side="left", padx=(6, 0))
+
+        ttk.Label(box, text="Source").grid(row=1, column=0, sticky="w", pady=2)
+        self._view_combo = ttk.Combobox(box, state="readonly", width=8, values=[])
+        self._view_combo.grid(row=1, column=1, sticky="w", padx=4)
+        self._view_combo.bind("<<ComboboxSelected>>", self._on_view_pick)
+
+        ttk.Label(box, text="Jumlah tile").grid(row=2, column=0, sticky="w", pady=2)
+        self._tile_combo = ttk.Combobox(box, state="disabled", width=8, values=[])
+        self._tile_combo.grid(row=2, column=1, sticky="w", padx=4)
+        self._tile_combo.bind("<<ComboboxSelected>>", self._on_view_mode)
+
+        ttk.Label(box, text="Status").grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Label(box, textvariable=self.status_var,
+                  font=("Consolas", 10, "bold")).grid(row=3, column=1, sticky="w", padx=4)
+    # ── Panel: Camera ─────────────────────────────────────────────────────
+    def _build_panel_camera(self, parent):
+        box = ttk.LabelFrame(parent, text="Kamera (dev)", padding=8)
+        box.pack(fill="x", pady=(0, 6))
+        ttk.Label(box, text="Device diatur di Logic Editor (＋ Add Source). "
+                            "Stream server & rekaman siklus selalu tile semua source.",
+                  foreground="#777777", wraplength=260).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        for row, (lbl, var) in enumerate(
+                [("Width", self.width), ("Height", self.height), ("FPS", self.fps)], start=1):
+            ttk.Label(box, text=lbl).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Entry(box, textvariable=var, width=10).grid(row=row, column=1, sticky="ew", padx=4)
+        ttk.Label(box, text="Format").grid(row=4, column=0, sticky="w", pady=2)
+        ttk.Combobox(box, textvariable=self.format_var, values=["mp4 (H.264)", "mp4 (H.265)"],
+                     state="readonly", width=12).grid(row=4, column=1, sticky="ew", padx=4)
+        ttk.Checkbutton(box, text="Mirror (semua source)", variable=self.mirror_var).grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.open_btn = ttk.Button(box, text="Buka Source", command=self.toggle_camera)
+        self.open_btn.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+    def _on_view_mode(self, _=None):
+        if self._roi_editor is not None:             # editor ROI selalu 1 source
+            self._view_mode_var.set("single")
+            return
+        self._view_mode = self._view_mode_var.get()
+        try:
+            self._tile_n = int(self._tile_combo.get())
+            self._tile_scroll = 0
+        except ValueError:
+            pass
+        tile = self._view_mode == "tile"
+        self._tile_combo.config(state="readonly" if tile else "disabled")
+        self._view_combo.config(state="disabled" if tile else "readonly")
+
+    def _on_view_pick(self, _=None):
+        t = self._view_combo.get()
+        if t[1:].isdigit() and self._roi_editor is None:
+            self._view_slot = int(t[1:])
+    # ── Panel: YOLO ───────────────────────────────────────────────────────
+
+    def _build_panel_yolo(self, parent):
+        yolo_box = ttk.LabelFrame(parent, text="YOLO Detector", padding=8)
+        yolo_box.pack(fill="x", pady=(0, 6))
+
+        ttk.Label(yolo_box, text="Model diatur per source di Logic Editor "
+                                 "(Source → Pilih Model…).",
+                  foreground="#777777", wraplength=260).pack(anchor="w", pady=(0, 4))
+        self._model_rows = ttk.Frame(yolo_box)      # satu baris per source: label + tombol
+        self._model_rows.pack(fill="x", pady=(0, 6))
+
+        conf_hdr = ttk.Frame(yolo_box)
+        conf_hdr.pack(fill="x")
+        ttk.Label(conf_hdr, text="Confidence:").pack(side="left")
+        self.conf_label = ttk.Label(conf_hdr, text="0.25", width=4)
+        self.conf_label.pack(side="right")
+
+        ttk.Scale(
+            yolo_box,
+            from_=0.01,
+            to=1.0,
+            orient="horizontal",
+            variable=self.conf_var,
+            command=self._on_conf_change,
+        ).pack(fill="x", pady=(2, 6))
+
+        self.yolo_btn = ttk.Button(
+            yolo_box,
+            text="▶  Aktifkan Semua",
+            command=self._toggle_yolo,
+            state="disabled",
+        )
+        self.yolo_btn.pack(fill="x", ipady=3)
+        ttk.Label(yolo_box, textvariable=self.det_count_var, font=("Arial", 9)).pack(
+            anchor="center", pady=(3, 0)
+        )
+
+        ttk.Label(yolo_box, text="Track Class:", font=("Arial", 9, "bold")).pack(
+            anchor="w", pady=(8, 2)
+        )
+        self._class_list_frame = ttk.Frame(yolo_box)
+        self._class_list_frame.pack(fill="x", padx=4)
+
+    # ── Panel: Capture ────────────────────────────────────────────────────
+
+    def _build_panel_capture(self, parent):
+        cap_box = ttk.LabelFrame(parent, text="Capture", padding=8)
+        cap_box.pack(fill="x", pady=(0, 6))
+
+        self.photo_btn = ttk.Button(
+            cap_box, text="📷  FOTO  [F]", command=self.take_photo, state="disabled"
+        )
+        self.photo_btn.pack(fill="x", ipady=5, pady=2)
+        self.pause_btn = ttk.Button(
+            cap_box,
+            text="⏸  PAUSE (TEST)  [P]",
+            command=self.toggle_pause,
+            state="disabled",
+        )
+        self.pause_btn.pack(fill="x", ipady=5, pady=2)
+        self.record_btn = ttk.Button(
+            cap_box,
+            text="🎥  MULAI REKAM  [R]",
+            command=self.toggle_recording,
+            state="disabled",
+        )
+        self.record_btn.pack(fill="x", ipady=5, pady=2)
+
+        ttk.Label(cap_box, text="Durasi").pack(anchor="w", pady=(6, 0))
+        ttk.Label(
+            cap_box, textvariable=self.timer_var, font=("Consolas", 16, "bold")
+        ).pack(anchor="center")
+        ttk.Label(cap_box, textvariable=self.photo_count_var, font=("Arial", 9)).pack(
+            anchor="center", pady=(2, 0)
+        )
+
+    # ── Panel: SERVER ─────────────────────────────────────────────────────
+
+    def _build_panel_server(self, parent):
+        box = ttk.LabelFrame(parent, text="SERVER", padding=8)
+        box.pack(fill="x", pady=(0, 6))
+        ip_row = ttk.Frame(box)
+        ip_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(ip_row, text="IP Master", width=12, anchor="w").pack(side="left")
+        ttk.Entry(ip_row, textvariable=self._var_master_ip, width=15).pack(
+            side="left", fill="x", expand=True)
+        ttk.Label(ip_row, text=" :").pack(side="left")
+        ttk.Entry(ip_row, textvariable=self._var_master_port, width=6,
+                  justify="center").pack(side="left")
+        ttk.Button(box, text="💾  Simpan & Hubungkan",
+                   command=self._apply_master_target).pack(fill="x", pady=(0, 6), ipady=2)
+        def _row(lbl, var):
+            r = ttk.Frame(box)
+            r.pack(fill="x", pady=1)
+            ttk.Label(r, text=lbl, width=12, anchor="w").pack(side="left")
+            ttk.Label(r, textvariable=var, font=("Consolas", 10)).pack(
+                side="left", fill="x", expand=True, anchor="w"
+            )
+
+        tr_row = ttk.Frame(box)
+        tr_row.pack(fill="x", pady=(0, 2))
+        ttk.Label(tr_row, text="Kirim status", width=12, anchor="w").pack(side="left")
+        self._transport_combo = ttk.Combobox(tr_row, state="readonly", width=5,
+                                             values=["TCP", "UDP"])
+        self._transport_combo.set(fd_slave_api.get_transport().upper())
+        self._transport_combo.pack(side="left")
+        self._transport_combo.bind("<<ComboboxSelected>>", self._on_transport_pick)
+        ttk.Label(tr_row, text="  Port UDP").pack(side="left")
+        self._udp_port_var = tk.StringVar(value=fd_slave_api.get_udp_port_override())
+        udp_entry = ttk.Entry(tr_row, textvariable=self._udp_port_var, width=6, justify="center")
+        udp_entry.pack(side="left")
+        udp_entry.bind("<Return>", self._on_transport_pick)
+        ttk.Label(box, text="Port UDP kosong = otomatis (saran server, lalu sama dengan port HB). "
+                            "UDP hanya untuk heartbeat/state; data siklus & video tetap HTTP.",
+                  foreground="#777777", wraplength=260).pack(anchor="w", pady=(0, 6))
+        _row("Status",    self._var_server)
+        _row("Takt Time", self._var_takt)
+        _row("Timeout",   self._var_disc_lim)
+
+        self._server_indicator = tk.Label(box, text="●", fg="#888", font=("Arial", 16))
+        self._server_indicator.pack(pady=(4, 0))
+        self._reconnect_btn = ttk.Button(
+            box, text="🔄  Reconnect Server", command=self._reconnect_server
+        )
+        self._reconnect_btn.pack(fill="x", pady=(6, 0), ipady=3)
+
+    # ── Panel: Storage ────────────────────────────────────────────────────
+
+    def _build_panel_storage(self, parent):
+        box = ttk.LabelFrame(parent, text="Penyimpanan", padding=8)
+        box.pack(fill="x", pady=(0, 6))
+        ttk.Label(box, textvariable=self.folder_var, wraplength=260).pack(
+            anchor="w", pady=(0, 4)
+        )
+        ttk.Button(box, text="Pilih Folder", command=self.select_folder).pack(fill="x")
+        ttk.Button(box, text="Sync Video ke Server",
+                   command=self._sync_videos_now).pack(fill="x", pady=(4, 0))
+
+    # ── Panel: Status ─────────────────────────────────────────────────────
+
+    def _build_panel_status(self, parent):
+        box = ttk.LabelFrame(parent, text="Status", padding=8)
+        box.pack(fill="x")
+        ttk.Label(box, text="Camera:").pack(anchor="w")
+        ttk.Label(box, textvariable=self.status_var, font=("Arial", 10, "bold")).pack(
+            anchor="w", pady=(0, 4)
+        )
+        ttk.Label(box, text="Recording:").pack(anchor="w")
+        ttk.Label(box, textvariable=self.record_status_var, font=("Arial", 10, "bold")).pack(
+            anchor="w"
+        )
+        ttk.Separator(box, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Checkbutton(
+            box, text="🐞  Debug Mode",
+            variable=self._debug_var, command=self._toggle_debug,
+        ).pack(anchor="w")
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  UI helpers
+    # ──────────────────────────────────────────────────────────────────────
+    def _set_mode(self, mode: str, persist: bool = False):
+        self._mode = mode
+        if mode == "production":
+            self._setting_frame.pack_forget()
+            self._mode_label.config(text="PRODUCTION", foreground="#2e7d32")
+            self._mode_btn.config(text="🔒  Ganti ke Dev Mode (login)")      # di cabang production
+            self.root_status.config(text="Production Mode")
+        else:
+            self._setting_frame.pack(fill="x")
+            self._mode_label.config(text="DEV", foreground="#ef6c00")
+            self._mode_btn.config(text="▶  Ganti ke Production Mode")        # di cabang dev
+            self.root_status.config(text="Dev Mode")
+        self._ctrl_canvas.yview_moveto(0)
+        if persist:
+            self._save_mode(mode)
+
+    def _on_mode_button(self):
+        if self._mode == "dev":
+            if self._roi_editor is not None:
+                messagebox.showinfo("Mode", "Tutup Logic Editor dulu sebelum pindah ke Production.")
+                return
+            self._set_mode("production", persist=True)      # dev -> production: tanpa login
+            self._on_start_production()                     # auto load seperti START
+            return
+        if self._require_login(startup=False):              # production -> dev: wajib login
+            self._set_mode("dev", persist=True)
+        else:
+            self.root_status.config(text="Login dibatalkan — tetap di Production Mode")
+
+    def _set_operator(self, value: str):
+        value = value.strip()
+        if value:
+            self._var_operator.set(value)
+            self.args.operator = value
+            self.root_status.config(text=f"Operator: {value}")
+    def _toggle_debug(self):
+        on = bool(self._debug_var.get())
+        if on:
+            set_debug_logging(True)
+            self._logger.set_enabled(True)
+            logger.info("[Debug] Debug Mode AKTIF (terminal + file)")
+        else:
+            logger.info("[Debug] Debug Mode MATI (semua log dimatikan)")   # pesan terakhir
+            self._logger.set_enabled(False)
+            set_debug_logging(False)
+        self.root_status.config(
+            text="Debug Mode ON — log di terminal dan file" if on
+            else "Debug Mode OFF — semua log dimatikan")
+    def toggle_pause(self):
+        """TEST MODE: bekukan preview, tapi timer cycle/discard tetap jalan."""
+        self._paused = not self._paused
+        self.hub.paused = self._paused
+        if self._paused:
+            self.pause_btn.config(text="▶  RESUME  [P]")
+            self.root_status.config(
+                text="⏸ PAUSE — preview dibekukan, timer tetap jalan (mode test)"
+            )
+            logger.info("[Pause] Preview dibekukan, timer tetap jalan")
+        else:
+            self.pause_btn.config(text="⏸  PAUSE (TEST)  [P]")
+            self.root_status.config(text="▶ RESUME — stream kembali normal")
+            logger.info("[Pause] Resume")
+    def _set_cycle_state(self, state: str):
+        self._var_state.set(state)
+        self._live_state = state
+        self._state_evt.set()
+        colors = {
+            "IDLE": None, "RUNNING": "#2e7d32", "TRANSIT": "#ef6c00",
+            "COMPLETE": "#f57f17", "TIMEOUT": "#c62828", "FAILED": "#c62828",
+            "CAMERA_OFFLINE": "#6a1b9a",
+            "DISCARD": "#c62828",
+        }
+        fg = colors.get(state)
+        if fg:
+            self._state_label.config(foreground=fg)
+        else:
+            self._state_label.config(foreground="")
+    
+    def _shift_tick(self):
+        """Cek tiap 1 detik. Saat ganti shift: reset label dan hitung ulang dari disk."""
+        try:
+            name, start, end = shift_info(datetime.now())
+            self._var_clock.set(datetime.now().strftime("%d-%m-%Y  %H:%M:%S"))
+            if start != self._shift_key:
+                self._shift_key = start
+                self._shift_ok = self._shift_anom = 0
+                self._var_ok_count.set("0")
+                self._var_anom_count.set("0")
+                self._var_cycle.set("0")
+                self._var_shift.set(f"{name} ({start:%H.%M} — {end:%H.%M})")
+                self._resync_shift_counts(start, end)                              # ← HILANG
+                logger.info(f"[Shift] {name} {start:%Y-%m-%d %H:%M} - {end:%H:%M}")  # ← HILANG
+        except Exception as e:
+            logger.error(f"[Shift] tick error: {e}", exc_info=True)
+        self.root.after(1000, self._shift_tick)
+
+    def _resync_shift_counts(self, start, end):
+        """Hitung ulang dari folder video di thread terpisah (tidak menahan UI)."""
+        def work():
+            ok, anom = count_shift_videos(start, end)
+
+            def apply():
+                if self._shift_key != start:
+                    return
+                self._shift_ok, self._shift_anom = ok, anom
+                self._var_ok_count.set(str(ok))
+                self._var_anom_count.set(str(anom))
+                self._var_cycle.set(str(ok + anom))
+
+            self._ui(apply)                                                        # ← HILANG
+
+        threading.Thread(target=work, daemon=True, name="shift-count").start()
+
+    def _on_cycle_ui_update(self, cycle_count: int, cycle_time: float, anom_type: str,
+                            is_genesis: bool = False, skipped=None, label: str = ""):
+        skipped = skipped or []
+        self._var_last_ct.set(f"{cycle_time:.1f}s")
+        color = {"OK": "#2e7d32", "LONG": "#c62828", "SHORT": "#ef6c00"}[anom_type]
+        if skipped and anom_type == "OK":
+            color = "#ef6c00"
+        self._last_ct_label.config(foreground=color)
+        self._ct_history.append(cycle_time)
+        self._ct_history = self._ct_history[-50:]
+        self._var_avg_ct.set(f"{sum(self._ct_history) / len(self._ct_history):.1f}s")
+        tag = {"OK": "OK", "LONG": "ANOMALY", "SHORT": "SHORT ANOMALY"}[anom_type]
+        if skipped and anom_type == "OK":
+            tag = "ANOMALY (expected terlewat)"
+        if is_genesis:
+            tag += " | GENESIS"
+        self.root_status.config(
+            text=f"Cycle {cycle_count} selesai | CT={cycle_time:.2f}s | {tag}"
+        )
+        if anom_type != "OK" or skipped:
+            self._shift_anom += 1
+        else:
+            self._shift_ok += 1
+        self._var_ok_count.set(str(self._shift_ok))
+        self._var_anom_count.set(str(self._shift_anom))
+        self._var_cycle.set(str(self._shift_ok + self._shift_anom))
+
+    def _bind_shortcuts(self):
+        def key(action, cond):
+            def h(e):
+                if isinstance(e.widget, (tk.Entry, ttk.Entry, tk.Text)):
+                    return
+                if cond():
+                    action()
+            return h
+        self.root.bind("<p>", key(self.toggle_pause, lambda: self.running))
+        self.root.bind("<f>", key(self.take_photo, lambda: self.hub.frame(self._view_slot) is not None))
+        self.root.bind("<r>", key(self.toggle_recording, lambda: self.running))
+        self.root.bind("<F11>", lambda e: self.root.attributes(
+            "-fullscreen", not self.root.attributes("-fullscreen")))
+        
+    def _bind_mouse_scroll(self):
+        def _scroll2(e):
+            self._ctrl_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+        def _bind_children(widget):
+            widget.bind("<MouseWheel>", _scroll2)
+            for child in widget.winfo_children():
+                _bind_children(child)
+
+        _bind_children(self._ctrl_frame)
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  YOLO controls
+    # ──────────────────────────────────────────────────────────────────────
+    def _update_model_info(self):
+        icon = {"ready": "✓", "loading": "…", "failed": "✗ GAGAL", "none": "—"}
+        for w in self._model_rows.winfo_children():
+            w.destroy()
+        rows = self.yolo.summary()
+        if not rows:
+            ttk.Label(self._model_rows, text="Belum ada source",
+                      foreground="#777777").pack(anchor="w")
+        for s, name, st in rows:
+            r = ttk.Frame(self._model_rows)
+            r.pack(fill="x", pady=1)
+            ttk.Label(r, text=f"S{s}: {name or 'tanpa model'} {icon[st]}",
+                      font=("Consolas", 9)).pack(side="left")
+            on = self.yolo.slot_enabled(s)
+            ttk.Button(r, text="⏹ OFF" if on else "▶ ON", width=7,
+                       state="normal" if st == "ready" else "disabled",
+                       command=lambda s=s: self._toggle_slot(s)).pack(side="right")
+        self._refresh_yolo_btn()
+        self._bind_mouse_scroll()
+
+    def _on_models_ready(self):
+        """Dipanggil (main thread) tiap status model berubah."""
+        self._update_model_info()
+        ready = self.yolo.any_ready()
+        self.yolo_btn.config(state="normal" if ready else "disabled")
+        if ready:
+            self._build_class_checklist(self.yolo.get_class_names())
+        elif self.yolo.enabled:
+            self._toggle_yolo()
+        if self._ct_recorder is None:
+            self._sync_recorder()
+        if ready and self._reporter is None and not getattr(self.args, "nondebug", False):
+            self._reporter = CycleReporter(self.output_dir)
+            self._logger.log("REPORT", f"CSV: {self._reporter.path()}")
+
+    def _badge(self, img, slot):
+        st = self.yolo.slot_state(slot)
+        if st == "ready":
+            return
+        txt = {"none": "NO MODEL", "loading": "MODEL LOADING...",
+               "failed": "MODEL ERROR"}[st]
+        y = img.shape[0] - 10
+        cv2.putText(img, txt, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(img, txt, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1, cv2.LINE_AA)
+
+    def _on_conf_change(self, _=None):
+        v = round(self.conf_var.get(), 2)
+        self.conf_label.config(text=f"{v:.2f}")
+        self.yolo.set_conf(min(v, self._roi_min_conf))
+
+    def _toggle_yolo(self):
+        """Tombol global: aktifkan / nonaktifkan semua source."""
+        self.yolo.enabled = not self.yolo.enabled
+        if not self.yolo.enabled:
+            self.det_count_var.set("Deteksi: 0")
+        self._update_model_info()
+
+    def _toggle_slot(self, slot):
+        self.yolo.set_slot_enabled(slot, not self.yolo.slot_enabled(slot))
+        if not self.yolo.enabled:
+            self.det_count_var.set("Deteksi: 0")
+        self._update_model_info()
+
+    def _refresh_yolo_btn(self):
+        self.yolo_btn.config(
+            text="⏹  Nonaktifkan Semua" if self.yolo.enabled else "▶  Aktifkan Semua")
+
+    def _build_class_checklist(self, names: dict):
+        # Pakai state centang saat ini kalau model di-load ulang; kalau belum ada, pakai yang tersimpan
+        if self._class_vars:
+            disabled = {l for l, v in self._class_vars.items() if not v.get()}
+        else:
+            disabled = set(self._saved_disabled_classes)
+        for w in self._class_list_frame.winfo_children():
+            w.destroy()
+        self._class_vars.clear()
+        for cls_id in sorted(names.keys()):
+            label = names[cls_id]
+            var = tk.BooleanVar(value=label not in disabled)
+            self._class_vars[label] = var
+            ttk.Checkbutton(
+                self._class_list_frame,
+                text=label,
+                variable=var,
+                command=self._on_class_selection_change,
+            ).pack(anchor="w")
+        self._on_class_selection_change()
+        self._bind_mouse_scroll()
+
+    def _on_class_selection_change(self):
+        self._tracked_classes = {
+            lbl for lbl, var in self._class_vars.items() if var.get()
+        }
+        self.yolo.set_tracked_classes(self._tracked_classes)
+    # ──────────────────────────────────────────────────────────────────────
+    #  Camera
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _codec(self):
+        return "libx265" if "H.265" in self.format_var.get() else "libx264"
+
+    def _sync_recorder(self):
+        slots = self.hub.slots()
+        if not slots:
+            return
+        cell = rec_cell(self.hub.sizes(), slots)
+        w, h = canvas_size(len(slots), cell)
+        fps = self.OUTPUT_FPS
+        if self._ct_recorder is None:
+            if self.args.no_record or not self.args.station_no or not self.args.line:
+                return
+            self._cell = cell
+            self._ct_recorder = VideoRecorder(
+                station_id=self.args.station_no, line=self.args.line,
+                frame_width=w, frame_height=h, fps=fps, codec=self._codec())
+        elif not self._ct_recorder.recording:        # ukuran tidak boleh berubah saat merekam
+            self._cell = cell
+            self._ct_recorder.configure(w, h, fps, self._codec())
+    # ──────────────────────────────────────────────────────────────────────
+    #  Camera
+    # ──────────────────────────────────────────────────────────────────────
+
+    def toggle_camera(self):
+        if self.running:
+            self.stop_camera()
+        else:
+            self.start_camera()
+
+    def start_camera(self):
+        if self.running:
+            return
+        self.running = True
+        self._paused = False
+        self.hub.paused = False
+        self._adapted.clear()
+        self._set_cycle_state("IDLE")
+        self._sync_sources()
+        self._comp_run = True
+        self._comp_thread = threading.Thread(target=self._compose_loop, daemon=True,
+                                             name="tile-composer")
+        self._comp_thread.start()
+        n = len(self.hub.slots())
+        self.status_var.set(f"ON - {n} source")
+        self.open_btn.config(text="Tutup")
+        self.photo_btn.config(state="normal")
+        self.record_btn.config(state="disabled")
+        self.pause_btn.config(state="normal", text="⏸  PAUSE (TEST)  [P]")
+        self.root_status.config(
+            text="Membuka source..." if n else "Belum ada source — tambahkan lewat Logic Editor")
+        self._schedule_ui_update()
+
+    def stop_camera(self, crashed: bool = False):
+        if self.recording:
+            self.stop_recording()
+        self.running = False
+        self._comp_run = False
+        if self._comp_thread:
+            self._comp_thread.join(timeout=1)
+            self._comp_thread = None
+        self.hub.stop_all()
+        with self._frame_lock:
+            self._latest_frame = None
+        tracker = self.yolo._tracker
+        if tracker and tracker.is_cycle_active():
+            tracker.abort_cycle()
+            if self._ct_recorder:
+                self._ct_recorder.discard()
+            self._logger.log("DISCARD", "source ditutup — siklus dibatalkan")
+        self.preview.config(image="", text="Camera Preview")
+        self.status_var.set("Source belum dibuka")
+        self.open_btn.config(text="Buka Source")
+        self.photo_btn.config(state="disabled")
+        self.record_btn.config(state="disabled")
+        self.pause_btn.config(state="disabled", text="⏸  PAUSE (TEST)  [P]")
+        self._paused = False
+        self._hold_state_until = 0.0
+        self._var_elapsed.set("—")
+        self._set_cycle_state("IDLE")
+        self.root_status.config(text="Source ditutup")
+
+    def _sync_sources(self, sources=None, retry: bool = False):
+        if sources is None:
+            cfg = self._logic_config
+            sources = cfg.sources if cfg else {}
+        self.yolo.assign({s: d.model for s, d in sources.items()}, retry=retry)
+        self._update_model_info()
+        req = (self._var_int(self.width, 640), self._var_int(self.height, 480),
+               self._var_int(self.fps, 24))
+        self.hub.sync(sources, bool(self.mirror_var.get()), req)
+        slots = self.hub.slots()
+        self._view_combo.config(values=[f"S{s}" for s in slots])
+        if slots and self._view_slot not in slots:
+            self._view_slot = slots[0]
+        self._view_combo.set(f"S{self._view_slot}" if slots else "")
+        n = len(slots)
+        self._tile_combo.config(values=[str(i) for i in range(1, n + 1)])
+        self._tile_n = max(1, min(self._tile_n, n)) if n else 1
+        self._tile_combo.set(str(self._tile_n))
+        if n != self._last_n:                       # ukuran tile berubah -> siklus berjalan tidak valid
+            self._last_n = n
+            if self.yolo.engine.is_cycle_active():
+                self.yolo.engine.abort_cycle()
+                if self._ct_recorder:
+                    self._ct_recorder.discard()
+        self._sync_recorder()
+
+    def _on_source_frame(self, slot, frame, ts):
+        self.yolo.push(frame, slot)
+
+    def _adapt_sources(self):
+        """Sesuaikan ROI tiap source ke resolusi/mirror aktualnya (terisolasi per slot)."""
+        if self._roi_editor is not None:        # editor mengurus adaptasinya sendiri
+            return
+        m = bool(self.mirror_var.get())
+        for slot, (w, h) in self.hub.sizes().items():
+            if not (w and h) or self._adapted.get(slot) == (w, h, m):
+                continue
+            self._adapted[slot] = (w, h, m)
+            notes = self.yolo.engine.adapt(slot, w, h, m)
+            if notes:
+                logger.info(f"[Logic] ROI disesuaikan: {', '.join(notes)}")
+        if (self.record_btn.cget("state") == "disabled"
+                and any(w and h for w, h in self.hub.sizes().values())):
+            self.record_btn.config(state="normal")
+
+    def _check_sources(self):
+        """Source yang dipakai ROI putus -> hentikan produksi; pulih -> lanjut."""
+        cfg = self._logic_config
+        if cfg is None or self._roi_editor is not None:
+            return
+        used = {r.source for r in cfg.all_rois()}
+        lost = sorted((used & self.hub.lost())
+                      | {s for s in used if self.yolo.slot_state(s) == "failed"})
+        if lost and self._var_state.get() != "CAMERA_OFFLINE":
+            self.yolo.engine_enabled = False
+            self.yolo.engine.abort_cycle()
+            if self._ct_recorder:
+                self._ct_recorder.discard()
+            self._logger.log("CAMERA", f"source offline: {lost}")
+            self._set_cycle_state("CAMERA_OFFLINE")
+            self.root_status.config(text="⚠ Source offline: " + ", ".join(f"S{s}" for s in lost))
+        elif not lost and self._var_state.get() == "CAMERA_OFFLINE":
+            self.yolo.engine_enabled = True
+            self._set_cycle_state("IDLE")
+            self.root_status.config(text="Semua source pulih")
+
+    def _view_slots(self) -> list:
+        slots = self.hub.slots()
+        if self._view_mode == "tile":
+            return slots[:max(1, self._tile_n)]
+        return [self._view_slot] if self._view_slot in slots else slots[:1]
+
+    def _ann_frame(self, slot):
+        """Frame berlabel YOLO bila aktif, kalau tidak frame mentah."""
+        if self.yolo.slot_enabled(slot):
+            drawn, _, _ = self.yolo.get_result(slot)
+            if drawn is not None:
+                return drawn
+        return self.hub.frame(slot)
+
+    def _decorate_cell(self, slot, cell_img, sw, sh):
+        self.roi_view.set_scale(cell_img.shape[1], cell_img.shape[0], sw, sh)
+        self.roi_view.draw_on_frame(cell_img, slot)
+        self._badge(cell_img, slot)
+
+    def _tile_preview(self):
+        slots = self.hub.slots()                      # SEMUA source, bukan slots[:n]
+        if not slots:
+            return None
+        pw = self._preview_container.winfo_width() or 800
+        ph = self._preview_container.winfo_height() or 580
+        lost = self.hub.lost()
+
+        k = max(1, min(self._tile_n, len(slots)))     # jumlah tile yang terlihat sekaligus
+        cols, vis_rows = grid_for(k)
+        cell = (max(1, pw // cols), max(1, ph // vis_rows))
+
+        def get(s):
+            if s in lost:
+                return None
+            f = self._ann_frame(s)
+            return None if f is None else cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+
+        canvas = compose(slots, get, cell, decorate=self._decorate_cell, cols=cols)
+        total = canvas.shape[0]
+        self._tile_step = cell[1]
+        self._tile_total = total
+        self._tile_scroll = max(0, min(self._tile_scroll, max(0, total - ph)))
+        self._tile_sb_update(total, ph)
+        off = self._tile_scroll
+        return np.ascontiguousarray(canvas[off:off + ph])
+
+    def _tile_sb_update(self, total, view):
+        if total <= view:
+            self._tile_scroll = 0
+            if self._tile_sb_shown:
+                self._tile_sb.grid_remove()
+                self._tile_sb_shown = False
+            return
+        if not self._tile_sb_shown:
+            self._tile_sb.grid()
+            self._tile_sb_shown = True
+        self._tile_sb.set(self._tile_scroll / total, (self._tile_scroll + view) / total)
+
+    def _on_tile_wheel(self, e):
+        if self._view_mode != "tile" or self._roi_editor is not None:
+            return
+        up = getattr(e, "delta", 0) > 0 or getattr(e, "num", None) == 4
+        self._tile_scroll += -self._tile_step if up else self._tile_step
+
+    def _on_tile_sbar(self, *a):
+        if a[0] == "moveto":
+            self._tile_scroll = int(float(a[1]) * self._tile_total)
+        elif a[0] == "scroll":
+            self._tile_scroll += int(a[1]) * self._tile_step
+
+    def _compose_loop(self):
+        """Satu jam OUTPUT_FPS: tile semua source -> server + recorder siklus (+ rekam manual)."""
+        iv = 1.0 / self.OUTPUT_FPS
+        nxt = time.perf_counter()
+        while self._comp_run:
+            nxt += iv
+            wait = nxt - time.perf_counter()
+            if wait > 0:
+                time.sleep(wait)
+            else:
+                nxt = time.perf_counter()
+            if self.hub.paused:
+                continue
+            try:
+                slots = self.hub.slots()
+                if not slots:
+                    continue
+                lost = self.hub.lost()
+                raw_get = lambda s: None if s in lost else self.hub.frame(s)
+                ts = time.time()
+                sizes = self.hub.sizes()
+                rec = self._ct_recorder
+                cell = self._cell
+                if cell is None or rec is None or not rec.recording:
+                    cell = rec_cell(sizes, slots)            # boleh berubah selama tidak merekam
+                    if cell != self._cell:
+                        self._cell = cell
+                        if rec:                              # tanpa codec: tidak menyentuh Tk dari thread ini
+                            w, h = canvas_size(len(slots), cell)
+                            rec.configure(w, h, self.OUTPUT_FPS)
+                canvas = compose(slots, raw_get, cell)
+                with self._frame_lock:
+                    self._latest_frame = canvas
+                fd_slave_api.push_frame(canvas, layout_meta(slots, cell, sizes=sizes))
+                if rec and (canvas.shape[1], canvas.shape[0]) == (rec.frame_width, rec.frame_height):
+                    rec.write_frame(canvas, ts)              # lewati bila ukuran tidak cocok dengan pipe ffmpeg
+
+                rs = self._rec_slots
+                if self.recording and rs:
+                    raw = compose(rs, raw_get, self._rec_cell)
+                    ann = raw
+                    if self.yolo.enabled:
+                        ann = compose(rs, lambda s: None if s in lost else self._ann_frame(s),
+                                      self._rec_cell)
+                    try:
+                        self._write_queue.put_nowait((raw, ann, time.perf_counter()))
+                    except queue.Full:
+                        pass
+            except Exception as e:
+                logger.error(f"[Tile] compose error: {e}", exc_info=True)
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  UI update loop
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _schedule_ui_update(self):
+        if not self.running:
+            return
+        try:
+            slot = self._view_slot
+            if self.yolo.slot_enabled(slot):
+                self.det_count_var.set(f"Deteksi: {len(self.yolo.get_result(slot)[2])}")
+            else:
+                self.det_count_var.set("Deteksi: 0")
+            self._adapt_sources()
+            self._check_sources()
+
+            resized = None
+            if self._view_mode == "tile" and self._roi_editor is None:
+                resized = self._tile_preview()
+            else:
+                self._tile_sb_update(0, 1)
+                display = self._ann_frame(slot)
+                if display is not None:
+                    self._frame_h, self._frame_w = display.shape[:2]
+                    prev_w = self._preview_container.winfo_width()
+                    prev_h = self._preview_container.winfo_height()
+                    rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+                    resized = self._resize_for_preview(rgb, prev_w or 800, prev_h or 580)
+                    rh, rw = resized.shape[:2]
+                    if self._roi_editor is not None:
+                        ox = max(0, (self.preview.winfo_width() - rw) // 2)
+                        oy = max(0, (self.preview.winfo_height() - rh) // 2)
+                        self._roi_editor.set_view(rw, rh, self._frame_w, self._frame_h,
+                                                  ox, oy, slot=slot)
+                        resized = self._roi_editor.draw_on_frame(resized)
+                    else:
+                        self.roi_view.set_scale(rw, rh, self._frame_w, self._frame_h)
+                        resized = self.roi_view.draw_on_frame(resized)
+                        self._badge(resized, slot)
+
+            if resized is not None:
+                img = Image.fromarray(resized)
+                photo = ImageTk.PhotoImage(image=img)
+                self.preview.config(image=photo, text="")
+                self.preview.image = photo
+
+                # Update server status
+                if self._takt:
+                    sio_ok = self._takt.is_connected
+                    saving = fd_slave_api.is_saving()
+                    hb_ok = fd_slave_api.is_hb_connected() or saving
+                    server_now = sio_ok and hb_ok
+                    if self._server_connected and not server_now:
+                        self._server_disconnected_since = time.time()
+                    elif not self._server_connected and server_now:
+                        self._server_disconnected_since = None
+                    self._server_connected = server_now
+                    if saving and sio_ok:
+                        color, text = "#1e88e5", "SAVING MODE"
+                    elif server_now:
+                        color, text = "#4caf50", "Terhubung ✓"
+                    elif sio_ok:
+                        color, text = "#ff9800", "HB PUTUS (reconnect...)"
+                    else:
+                        color, text = "#e53935", "TERPUTUS ✗"
+                    self._server_indicator.config(fg=color)
+                    self._var_server.set(f"{text} [{fd_slave_api.get_transport().upper()}]")
+                    self._var_takt.set(f"{self._takt.value:.1f}s")
+                    self._var_anom_lim.set(f"{self._takt.anomaly_timer:.0f}")
+                    self._var_disc_lim.set(f"{self._takt.discard_timeout:.0f}")
+                    self._var_min_lim.set(f"{self._takt.min_cycle:.1f}")
+                    sl = self._short_limit()
+                    self._var_short_lim.set(f"{sl:.1f}" if sl > 0 else "off")
+            # Timer anomaly + discard
+
+            self._check_timers()
+            if not (self.yolo._tracker and self.yolo._tracker.is_cycle_active()):
+                self._var_elapsed.set("—")
+            if self.recording:
+                self._update_timer()
+
+        except Exception as e:
+            logger.error(f"[UI] _schedule_ui_update error: {e}", exc_info=True)
+
+        self.root.after(33, self._schedule_ui_update)
+
+    @staticmethod
+    def _resize_for_preview(image, max_w, max_h):
+        h, w = image.shape[:2]
+        scale = min(max_w / w, max_h / h)
+        if scale >= 1:
+            return image
+        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+        return cv2.resize(image, (nw, nh), interpolation=cv2.INTER_AREA)
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Photo
+    # ──────────────────────────────────────────────────────────────────────
+
+    def take_photo(self):
+        raw = self.hub.frame(self._view_slot)
+        if raw is None:
+            return
+        raw = raw.copy()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        cv2.imwrite(os.path.join(self.output_dir, f"photo_{ts}_raw.jpg"), raw)
+        if self.yolo.slot_enabled(self._view_slot):
+            drawn, _, _ = self.yolo.get_result(self._view_slot)     # <- sebelumnya REC_SLOT
+            if drawn is not None:
+                cv2.imwrite(os.path.join(self.output_dir, f"photo_{ts}_ann.jpg"), drawn)
+        self._photo_count += 1
+        self.photo_count_var.set(f"Foto: {self._photo_count}")
+        self.root_status.config(text=f"Foto tersimpan: photo_{ts}_raw.jpg")
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Recording (ffmpeg manual — untuk rekam keseluruhan sesi)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def toggle_recording(self):
+        if self.recording:
+            self.stop_recording()
+        else:
+            self.start_recording()
+
+    def _make_pipe(self, filename, width, height, codec, crf):
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-s",
+            f"{width}x{height}",
+            "-pix_fmt",
+            "bgr24",
+            "-r",
+            str(self.OUTPUT_FPS),
+            "-i",
+            "-",
+            "-c:v",
+            codec,
+            "-crf",
+            crf,
+            "-preset",
+            "fast",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            filename,
+        ]
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def start_recording(self):
+        with self._frame_lock:
+            if self._latest_frame is None:
+                messagebox.showwarning("Rekam", "Kamera belum siap.")
+                return
+        if not shutil.which("ffmpeg"):
+            messagebox.showerror("Error", "FFmpeg tidak ditemukan.")
+            return
+        slots = self._view_slots()
+        if not slots:
+            messagebox.showwarning("Rekam", "Belum ada source.")
+            return
+        if len(slots) == 1:
+            w, h = self.hub.size(slots[0])
+            if not (w and h):
+                messagebox.showwarning("Rekam", f"S{slots[0]} belum menghasilkan frame.")
+                return
+            cell = (w - w % 2, h - h % 2)           # yuv420p butuh ukuran genap
+        else:
+            cell = fixed_cell(len(slots))
+        width, height = canvas_size(len(slots), cell)
+        codec = "libx265" if "H.265" in self.format_var.get() else "libx264"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._video_raw = os.path.join(self.output_dir, f"video_{ts}_raw.mp4")
+        self._video_ann = os.path.join(self.output_dir, f"video_{ts}_ann.mp4")
+        self._ffmpeg_raw = self._make_pipe(self._video_raw, width, height, codec, "28")
+        self._ffmpeg_ann = self._make_pipe(self._video_ann, width, height, codec, "28")
+        self._write_queue = queue.Queue(maxsize=120)     # harus sebelum recording = True
+        self._rec_cell = cell
+        self._rec_slots = slots                          # dikunci sampai berhenti
+        self.recording = True
+        self.record_start_time = time.time()
+        self._writer_thread = threading.Thread(target=self._writer_worker, daemon=True)
+        self._writer_thread.start()
+        self.record_btn.config(text="⏹  STOP REKAM  [R]")
+        self.record_status_var.set("● RECORDING")
+        self.root_status.config(text=f"Merekam → {os.path.basename(self._video_raw)}")
+
+    def _writer_worker(self):
+        total = 0
+        frame_dur = 1.0 / self.OUTPUT_FPS
+        last_ts = None
+        debt = 0.0
+        while True:
+            item = self._write_queue.get()
+            if item is None:
+                break
+            raw_frame, ann_frame, capture_ts = item
+            if last_ts is None:
+                repeat = 1
+                debt = 0.0
+            else:
+                gap = min(capture_ts - last_ts, 2.0)
+                total_due = gap + debt
+                repeat = int(total_due / frame_dur)
+                debt = total_due - (repeat * frame_dur)
+                repeat = max(1, repeat)
+            last_ts = capture_ts
+            raw_bytes = raw_frame.tobytes()
+            ann_bytes = ann_frame.tobytes()
+            for _ in range(repeat):
+                try:
+                    self._ffmpeg_raw.stdin.write(raw_bytes)
+                except BrokenPipeError:
+                    pass
+                try:
+                    self._ffmpeg_ann.stdin.write(ann_bytes)
+                except BrokenPipeError:
+                    pass
+                total += 1
+            self._write_queue.task_done()
+
+    def stop_recording(self):
+        self.recording = False
+        self._rec_slots = []
+        dur = time.time() - self.record_start_time if self.record_start_time else 0
+        if self._writer_thread and self._writer_thread.is_alive():
+            self._write_queue.put(None)
+            self._writer_thread.join()
+        self._writer_thread = None
+        for pipe in [self._ffmpeg_raw, self._ffmpeg_ann]:
+            if pipe:
+                try:
+                    pipe.stdin.close()
+                    pipe.wait()
+                except Exception:
+                    pass
+        self._ffmpeg_raw = self._ffmpeg_ann = None
+        self.record_start_time = None
+        self.timer_var.set("00:00:00")
+        self.record_btn.config(text="🎥  MULAI REKAM  [R]")
+        self.record_status_var.set("READY")
+        self.root_status.config(
+            text=f"Tersimpan: {os.path.basename(self._video_raw or '')} + _ann.mp4"
+        )
+
+    def _update_timer(self):
+        if not self.recording or self.record_start_time is None:
+            return
+        e = int(time.time() - self.record_start_time)
+        h, r = divmod(e, 3600)
+        m, s = divmod(r, 60)
+        self.timer_var.set(f"{h:02d}:{m:02d}:{s:02d}")
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Storage / lifecycle
+    # ──────────────────────────────────────────────────────────────────────
+
+    def select_folder(self):
+        folder = filedialog.askdirectory(initialdir=self.output_dir)
+        if folder and os.access(folder, os.W_OK):
+            self.output_dir = folder
+            self.folder_var.set(folder)
+
+    def close_app(self):
+        if self._roi_editor is not None and not self._roi_editor.confirm_close():
+            return
+        if self.recording:
+            if not messagebox.askyesno("Rekam Aktif", "Sedang merekam. Tutup?"):
+                return
+        self.yolo.stop()
+        self.sysmon.stop()
+        self.stop_camera()
+        if self._takt:
+            self._takt.disconnect()
+        if self._ct_recorder:
+            try:
+                self._ct_recorder.discard()
+            except Exception:
+                pass
+        if self._storage:
+            try:
+                self._storage.stop()
+            except Exception:
+                pass
+        self._logger.close()
+        logger.info("=== CT Monitor STOP ===")
+        self.root.destroy()
+
+    def _state_heartbeat_loop(self):
+        pending = None
+        last_state = None
+        while True:
+            # tidur 1 detik, atau bangun lebih cepat saat state berubah
+            self._state_evt.wait(timeout=1.0)
+            self._state_evt.clear()
+
+            tracker = self.yolo._tracker
+            active = tracker and tracker.is_cycle_active()
+            elapsed  = tracker.cycle_elapsed()     if active else None
+            roi_idle = tracker.seconds_since_roi() if active else None
+
+            state = self._live_state
+            if state != last_state:
+                if state in ("DISCARD", "CAMERA_OFFLINE"):
+                    pending = state
+                last_state = state
+
+            try:
+                if pending and pending != state:
+                    if fd_slave_api.send_state(pending, None, None):
+                        pending = None
+                ok = fd_slave_api.send_state(state, elapsed, roi_idle)   # selalu bawa roi_idle
+                if ok and pending == state:
+                    pending = None
+            except Exception as e:
+                logger.warning(f"[Heartbeat] gagal: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Entry point
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="CT Monitor")
+    parser.add_argument("--endpoint", default=None)
+    parser.add_argument("--operator", default=None) 
+    parser.add_argument("--takt-time", type=float, default=20.0)
+    parser.add_argument("--no-record", action="store_true")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING"])
+    parser.add_argument("--nondebug", action="store_true",
+                        help="Mulai dengan Debug Mode mati (tanpa log file)")
+    
+    args = parser.parse_args()
+    args.station_no = 0
+    args.station = 0
+    args.line    = ""
+
+    setup_logging(args.log_level, debug_files=not args.nondebug)
+    args.endpoint, _src = resolve_endpoint(args.endpoint)
+    logger.info(f"[Server] Target master: {args.endpoint} (sumber: {_src})")
+    win_perf.timer_1ms()
+    ok = win_perf.disable_throttling()
+    logger.info(f"[Perf] power throttling off: {ok}")
+    root = tk.Tk()
+    try:
+        ttk.Style().theme_use("clam")
+    except tk.TclError:
+        pass
+    style = ttk.Style()
+    style.configure("Selected.TFrame", background="#0055aa")
+
+    app = CTMonitorApp(root, args)
+    root.mainloop()

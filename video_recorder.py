@@ -1,0 +1,557 @@
+"""
+video_recorder.py
+=================
+Merekam video per cycle time.
+
+Kategori hasil rekaman (dua dimensi independen):
+  label        : ""  (normal)  | "GENESIS"
+  anomaly_type : "OK" | "LONG" | "SHORT"
+
+Penamaan file:
+  Normal            : l{line}_st{station}_{ts}_{ct}s.mp4
+  Normal + Genesis  : l{line}_st{station}_{ts}_{ct}s_GENESIS.mp4
+  Long              : l{line}_st{station}_{ts}_{ct}s_LONG_ANOMALY.mp4
+  Short             : l{line}_st{station}_{ts}_{ct}s_SHORT_ANOMALY.mp4
+  Long + Genesis    : ..._GENESIS_LONG_ANOMALY.mp4
+  Short + Genesis   : ..._GENESIS_SHORT_ANOMALY.mp4
+
+Folder:
+  videos/normal/   -> anomaly_type == OK
+  videos/anomaly/  -> LONG / SHORT (tidak pernah dihapus otomatis)
+
+Alur cycle diatur ROITracker di main.py:
+  menunggu ROI 1 -> GENESIS -> (ROI terakhir) -> cycle normal -> (ROI terakhir) -> ...
+  discard / timeout / kamera ditutup -> kembali menunggu ROI 1
+  Di ROI terakhir, stop_cycle() dan start_cycle() dipanggil dengan timestamp yang sama.
+"""
+import json as _json
+import logging
+import queue
+import shutil
+import subprocess
+import threading
+import time
+import urllib.request as _ur
+from collections import deque
+from functools import lru_cache
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+from storage_manager import StorageManager, TMP_DIR
+import re
+import win_perf
+
+logger = logging.getLogger(__name__)
+
+
+# ── ffmpeg / ffprobe ──────────────────────────────────────────────────────────
+
+def _find_ffmpeg() -> str:
+    here = Path(__file__).parent
+    for p in (here / "ffmpeg.exe", here / "bin" / "ffmpeg.exe",
+              Path(r"C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin\ffmpeg.exe")):  # ganti sesuai hasil --shimgen-noop
+        if p.exists():
+            return str(p.resolve())
+    found = shutil.which("ffmpeg.exe") or shutil.which("ffmpeg")
+    if found:
+        return found
+    raise FileNotFoundError("ffmpeg.exe tidak ditemukan.")
+
+
+def _find_ffprobe(ffmpeg: str) -> str:
+    p = Path(ffmpeg).with_name("ffprobe.exe")
+    if p.exists():
+        return str(p)
+    return shutil.which("ffprobe.exe") or shutil.which("ffprobe") or ""
+
+
+_FFMPEG = _find_ffmpeg()
+_FFPROBE = _find_ffprobe(_FFMPEG)
+
+
+def _probe_duration(path: Path) -> float:
+    if not _FFPROBE:
+        return 0.0
+    try:
+        r = subprocess.run(
+            [_FFPROBE, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=15)
+        return float(r.stdout.strip())
+    except Exception:
+        return 0.0
+
+def _fit_duration(src: Path, target: float) -> float:
+    """Hanya mengukur dan mencatat. Kecepatan video tidak pernah diubah."""
+    actual = _probe_duration(src)
+    if actual > 0 and abs(actual - target) > 0.1:
+        logger.warning(f"[VideoRecorder] durasi file {actual:.2f}s vs CT {target:.2f}s "
+                       f"(selisih {actual - target:+.2f}s)")
+    return actual
+
+
+# ── Metadata layout tile di dalam file mp4 ────────────────────────────────────
+# Satu video = satu kanvas tile. Posisi tiap source disimpan di tag "comment" mp4:
+#   {"canvas":[w,h],"tiles":[{"slot":1,"rect":[x,y,w,h]}, ...]}   (rect ternormalisasi 0..1)
+# Ikut file, jadi tidak ada sidecar yang bisa yatim dan tidak terkait siklus/DB.
+
+def _rate_k(width: int, height: int, fps: float) -> int:
+    """maxrate (kbps): minimal 1M, naik bila kanvas lebih besar supaya resolusi native tidak blok."""
+    floor = int(_MAXRATE.rstrip("Mm")) * 1000
+    return max(floor, int(width * height * fps * _BPP / 1000))
+
+
+def _layout_tag(layout) -> str:
+    if not layout or not layout.get("tiles"):
+        return ""
+    return _json.dumps({"canvas": layout["canvas"], "tiles": layout["tiles"]},
+                       separators=(",", ":"))
+
+
+@lru_cache(maxsize=256)
+def _read_layout_cached(path: str, mtime_ns: int):
+    if not _FFPROBE:
+        return None
+    try:
+        r = subprocess.run(
+            [_FFPROBE, "-v", "error", "-show_entries", "format_tags=comment",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=10)
+        tag = (_json.loads(r.stdout).get("format", {}).get("tags", {}) or {}).get("comment")
+        lay = _json.loads(tag) if tag else None
+        return lay if isinstance(lay, dict) and lay.get("tiles") else None
+    except Exception:
+        return None
+
+
+def read_layout(path):
+    """Baca layout tile dari file video; None bila tidak ada (video lama / bukan dari tile)."""
+    p = Path(path)
+    try:
+        return _read_layout_cached(str(p), p.stat().st_mtime_ns)
+    except OSError:
+        return None
+
+
+# ── Folder & konstanta ────────────────────────────────────────────────────────
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+_FPS = 24
+_CODEC = "libx265"
+_PRESET = "fast"
+_CRF = "27"
+_MAXRATE = "1M"           # batas bawah; bitrate naik mengikuti jumlah piksel (lihat _rate_k)
+_BPP = 0.05               # bit per piksel per frame untuk batas bitrate
+_BUFSIZE = "2M"
+_END = object()
+
+ANOMALY_TYPES = ("OK", "LONG", "SHORT")
+LABEL_GENESIS = "GENESIS"
+def _slug(text: str, maxlen: int = 40) -> str:
+    """Aman untuk nama file Windows: hanya huruf/angka, pemisah '-'."""
+    s = re.sub(r"[^A-Za-z0-9]+", "-", text or "").strip("-")
+    return s[:maxlen].strip("-") or "x"
+
+# ── Session: satu rekaman cycle ───────────────────────────────────────────────
+
+class _Session:
+    def __init__(self, cmd, temp_path, start_ts, fps):
+        self.cmd = cmd
+        self.pipe = None                 # diisi oleh thread sesi
+        self.temp_path = temp_path
+        self.start_ts = start_ts
+        self.fps = fps
+        self.queue = queue.Queue(maxsize=600)
+        self.aborted = False
+        self.failed = False              # ffmpeg gagal start
+        self.frames = 0
+        self.dropped = 0
+        self.end_ts = None
+        self.padded = 0
+        self.skipped = 0
+        self.thread = threading.Thread(target=self._run, daemon=True, name="vr-writer")
+        self.label = ""
+        self.peak = 0
+        self.rc = None
+        self.join_timeout = False
+        self.killed = False
+        self.errlog = None
+        self.thread.start()
+
+    def _spawn(self) -> bool:
+        t0 = time.perf_counter()
+        try:
+            self.errlog = open(self.temp_path.with_suffix(".log"), "wb")
+            self.pipe = subprocess.Popen(
+                self.cmd, stdin=subprocess.PIPE, stderr=self.errlog,
+                creationflags=getattr(subprocess, "ABOVE_NORMAL_PRIORITY_CLASS", 0))
+            win_perf.disable_throttling(getattr(self.pipe, "_handle", None))
+        except Exception as e:
+            self.failed = True
+            logger.error(f"[VideoRecorder] ffmpeg gagal start: {e}")
+            return False
+        logger.info(
+            f"[VideoRecorder] ffmpeg siap {(time.perf_counter() - t0) * 1000:.0f}ms "
+            f"| antre={self.queue.qsize()} frame")
+        return True
+
+    def _drain(self):
+        """ffmpeg gagal: kosongkan queue agar stop_cycle tidak memblokir."""
+        while not self.aborted:
+            item = self.queue.get()
+            if item is None or item[0] is _END:
+                break
+
+    def _write(self, frame) -> bool:
+        if self.pipe is None:
+            return False
+        try:
+            self.pipe.stdin.write(frame.tobytes())
+            return True
+        except (BrokenPipeError, OSError, ValueError):
+            return False
+
+    def _run(self):
+        if not self._spawn():
+            self._drain()
+            return
+        fd = 1.0 / self.fps
+        n, last = 0, None
+        while not self.aborted:
+            item = self.queue.get()
+            q = self.queue.qsize()
+            if q > self.peak:
+                self.peak = q
+            if item is None:
+                break
+            if item[0] is _END:
+                target = int(round((item[1] - self.start_ts) / fd))
+                while last is not None and n < target and self._write(last):
+                    n += 1
+                    self.padded += 1
+                break
+            frame, ts = item
+            if self.end_ts is not None and ts > self.end_ts:
+                continue                      # frame milik cycle berikutnya
+            idx = max(0, int(round((ts - self.start_ts) / fd)))
+            if last is None:
+                last = frame
+            while n < idx:
+                if not self._write(last):
+                    break
+                n += 1
+                self.padded += 1
+            if n == idx:
+                if self._write(frame):
+                    n += 1
+            else:
+                self.skipped += 1
+            last = frame
+        self.frames = n
+
+    def close(self):
+        self.thread.join(timeout=60)
+        self.join_timeout = self.thread.is_alive()
+        if self.pipe is None:
+            return
+        try:
+            self.pipe.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.rc = self.pipe.wait(timeout=60)
+        except Exception:
+            self.killed = True
+            self.pipe.kill()
+        if self.errlog:
+            self.errlog.close()
+# ── VideoRecorder ─────────────────────────────────────────────────────────────
+
+class VideoRecorder:
+    def __init__(self, station_id, line, frame_width, frame_height,
+                 fps=_FPS, codec=_CODEC):
+        self.station_id = station_id
+        self.line = line
+        self._prefix = f"l{line}_st{station_id}"
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        self.fps = fps
+        self.codec = codec
+        self._cur: Optional[_Session] = None
+        self._genesis_next = True
+        self._preroll = deque(maxlen=30)
+        self._pre_lock = threading.Lock()
+        self._lock = threading.Lock()
+
+    def configure(self, frame_width=None, frame_height=None, fps=None, codec=None):
+        with self._lock:
+            if self._cur is not None:
+                logger.warning("[VideoRecorder] configure diabaikan: sedang merekam")
+                return False
+            if frame_width:
+                self.frame_width = frame_width
+            if frame_height:
+                self.frame_height = frame_height
+            if fps:
+                self.fps = fps
+            if codec:
+                self.codec = codec
+            with self._pre_lock:
+                self._preroll.clear()
+            return True
+
+    @property
+    def recording(self) -> bool:
+        return self._cur is not None
+
+    def start_cycle(self, start_ts: Optional[float] = None, layout: Optional[dict] = None):
+        """layout: hasil tile_view.layout_meta(slots); ditulis ke metadata mp4."""
+        start_ts = start_ts or time.time()
+
+        # pengaman: rantai putus -> sesi lama dibuang, berikutnya genesis
+        with self._lock:
+            old, self._cur = self._cur, None
+            if old is not None:
+                self._genesis_next = True
+        if old is not None:
+            threading.Thread(target=self._abort, args=(old,), daemon=True).start()
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        temp = TMP_DIR / f"_tmp_{self._prefix}_{stamp}.mp4"
+        extra = ["-tag:v", "hvc1"] if self.codec == "libx265" else []
+        tag = _layout_tag(layout)
+        rate_k = _rate_k(self.frame_width, self.frame_height, self.fps)
+        if tag:
+            extra += ["-metadata", f"comment={tag}"]
+        cmd = [_FFMPEG, "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
+               "-s", f"{self.frame_width}x{self.frame_height}",
+               "-pix_fmt", "bgr24", "-r", str(self.fps), "-i", "-",
+               "-c:v", self.codec, "-crf", _CRF, "-preset", _PRESET,
+               "-maxrate", f"{rate_k}k", "-bufsize", f"{rate_k * 2}k",
+               "-pix_fmt", "yuv420p", *extra, "-movflags", "+faststart",
+               str(temp)]
+        s = _Session(cmd, temp, start_ts, self.fps)
+        s.label = LABEL_GENESIS if self._genesis_next else ""
+        self._genesis_next = False
+        with self._pre_lock:
+            for f, ts in self._preroll:
+                if ts >= start_ts:
+                    s.queue.put_nowait((f, ts))
+            self._preroll.clear()
+            self._cur = s
+        logger.info(f"[VideoRecorder] START | {self._prefix} | {self.fps}fps {self.codec}")
+
+    def write_frame(self, frame, ts: Optional[float] = None):
+        ts = ts or time.time()
+        with self._pre_lock:
+            s = self._cur
+            if s is None:
+                self._preroll.append((frame, ts))
+                return
+        try:
+            s.queue.put_nowait((frame, ts))
+        except queue.Full:
+            s.dropped += 1
+
+    def stop_cycle(self, cycle_time_sec, takt_time=None, is_anomaly=False,
+                   update_url="", anomaly_type="", end_ts: Optional[float] = None,
+                   label="", skipped=None, anomaly_label=""):
+        """
+        anomaly_type : "OK" | "LONG" | "SHORT"  (sumber kebenaran status anomali)
+        label        : "" | "GENESIS"
+        is_anomaly   : dipertahankan untuk kompatibilitas; hanya dipakai jika
+                       anomaly_type kosong (True -> LONG).
+        skipped      : [(roi_id, keterangan)] ROI 'expected' yang tidak terjadi → anomali
+        anomaly_label: teks lengkap, mis. "Anomaly+expected+LCD" (hanya dicatat di info)
+        """
+        end_ts = end_ts or time.time()
+        with self._lock:
+            s, self._cur = self._cur, None
+        if s is None:
+            logger.warning("[VideoRecorder] stop_cycle() tanpa rekaman aktif")
+            return None
+        s.end_ts = end_ts
+        q_at_stop = s.queue.qsize()
+        t_put = time.perf_counter()
+        try:
+            s.queue.put((_END, end_ts), timeout=2)
+        except queue.Full:
+            s.aborted = True
+            logger.error("[VideoRecorder] stop_cycle: queue penuh, sesi di-abort | %s", self._prefix)
+        logger.info("[VideoRecorder] STOP | %s | queue=%d | put=%.2fs | dropped=%d",
+                    self._prefix, q_at_stop, time.perf_counter() - t_put, s.dropped)
+
+        atype = (anomaly_type or ("LONG" if is_anomaly else "OK")).upper()
+        if atype not in ANOMALY_TYPES:
+            logger.warning(f"[VideoRecorder] anomaly_type tidak dikenal: {atype} -> LONG")
+            atype = "LONG"
+        skipped = list(skipped or [])
+        anomaly = atype != "OK" or bool(skipped)
+        label = (s.label or label or "").upper()
+
+        now = datetime.now()
+        ts_name = now.strftime("%Y%m%d_%H%M%S")
+        # milidetik di nama file agar dua cycle di detik yang sama tidak bentrok
+        ts_file = f"{ts_name}{now.microsecond // 1000:03d}"
+        ct_str = f"{cycle_time_sec:.1f}s".replace(".", "_")
+
+        parts = [self._prefix, ts_file, ct_str]
+        if label:
+            parts.append(label)
+        if atype != "OK":
+            parts.append(atype)
+        if skipped:
+            parts += ["EXPECTED", _slug("-".join(d for _, d in skipped))]
+        if anomaly:
+            parts.append("ANOMALY")
+        filename = "_".join(parts) + ".mp4"
+        final_path = StorageManager.get_save_dir(anomaly, now) / filename
+
+        info = {
+            "filename": filename,
+            "path": str(final_path),
+            "file_path": str(final_path),
+            "relative_path": StorageManager.to_relative(final_path),
+            "station_id": self.station_id,
+            "line": self.line,
+            "cycle_time_sec": cycle_time_sec,
+            "takt_time": takt_time,
+            "label": label,
+            "is_genesis": label == LABEL_GENESIS,
+            "is_anomaly": anomaly,
+            "anomaly_type": atype,
+            "skipped_expected": [{"id": i, "description": d} for i, d in skipped],
+            "anomaly_label": anomaly_label,
+            "recorded_at": ts_name,
+            "recorded_ts": end_ts,          # epoch FD, bebas masalah zona waktu
+            "size_mb": None,
+            "size_ready": False,
+            "update_url": update_url,
+        }
+        threading.Thread(
+            target=self._finalize,
+            args=(s, final_path, info),
+            daemon=True,
+            name="vr-finalize"
+        ).start()
+
+        return info
+
+    def discard(self):
+        with self._lock:
+            s, self._cur = self._cur, None
+            self._genesis_next = True
+        if s:
+            threading.Thread(target=self._abort, args=(s,), daemon=True).start()
+
+    # ── Background ────────────────────────────────────────────────────────────
+    def _finalize(self, s: _Session, dst: Path, info: dict):
+        try:
+            # 1. Tutup session / tunggu ffmpeg selesai
+            t0 = time.perf_counter()
+            s.close()
+            logger.info(
+                "[VideoRecorder] DIAG %s | close=%.1fs | rc=%s | join_timeout=%s | killed=%s "
+                "| aborted=%s | peak_queue=%d | dropped=%d | threads=%d",
+                info["filename"], time.perf_counter() - t0, s.rc, s.join_timeout,
+                s.killed, s.aborted, s.peak, s.dropped, threading.active_count())
+            try:
+                tail = s.temp_path.with_suffix(".log").read_bytes()[-400:].decode(errors="replace")
+                if s.rc not in (0, None) or s.killed:
+                    logger.error("[VideoRecorder] ffmpeg stderr tail: %s", tail)
+                s.temp_path.with_suffix(".log").unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            if not s.temp_path.exists():
+                logger.error("[VideoRecorder] File temp tidak ditemukan | %s", s.temp_path)
+                return
+
+            # 2. Koreksi durasi tanpa re-encode
+            raw_dur = _fit_duration(s.temp_path, info["cycle_time_sec"])
+
+            # 3. Pindah temp -> final (move aman lintas folder/drive)
+            try:
+                shutil.move(str(s.temp_path), str(dst))
+            except Exception as e:
+                logger.error(
+                    "[VideoRecorder] Move error | src=%s | dst=%s | error=%s",
+                    s.temp_path, dst, e)
+                return
+
+            # 4. Ukuran FINAL
+            size_bytes = dst.stat().st_size
+            size_mb = round(size_bytes / 1024 / 1024, 2)
+            info["size_bytes"] = size_bytes
+            info["size_mb"] = size_mb
+            info["size_ready"] = True
+
+            logger.info(
+                "[VideoRecorder] SIZE READY | filename=%s | bytes=%d | mb=%.2f",
+                dst.name, size_bytes, size_mb)
+
+            logger.info(
+                "[VideoRecorder] %s | label=%s | type=%s | "
+                "file(sebelum koreksi)=%.2fs | CT=%.2fs | frames=%d | "
+                "dropped=%d | padded=%d | skipped=%d | size=%.2fMB",
+                dst.name, info.get("label") or "-", info["anomaly_type"],
+                raw_dur, info["cycle_time_sec"], s.frames,
+                s.dropped, s.padded, s.skipped, size_mb)
+
+            # 5. Update ukuran file ke server
+            url = info.get("update_url", "")
+            if not url:
+                logger.warning(
+                    "[VideoRecorder] SIZE UPDATE dilewati: update_url kosong | filename=%s",
+                    dst.name)
+                return
+
+            payload = {
+                "filename": dst.name,
+                "size_mb": size_mb,
+                "size_bytes": size_bytes,
+            }
+            logger.info(
+                "[VideoRecorder] SIZE UPDATE -> %s | filename=%s | size_mb=%.2f | size_bytes=%d",
+                url, dst.name, size_mb, size_bytes)
+
+            req = _ur.Request(
+                url,
+                data=_json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with _ur.urlopen(req, timeout=3) as response:
+                    body = response.read().decode("utf-8", errors="replace")
+                    logger.info(
+                        "[VideoRecorder] SIZE UPDATE RESPONSE | filename=%s | status=%s | body=%s",
+                        dst.name, response.status, body)
+            except _ur.HTTPError as he:
+                if he.code == 404:
+                    logger.info(
+                        "[VideoRecorder] SIZE UPDATE: baris video belum ada di server, "
+                        "size_sync akan menyusul | filename=%s", dst.name)
+                else:
+                    raise
+            except (_ur.URLError, TimeoutError, OSError) as ne:
+                logger.warning(
+                    "[VideoRecorder] SIZE UPDATE ditunda, server tidak terjangkau "
+                    "(size_sync akan menyusul) | filename=%s | %s", dst.name, ne)
+
+        except Exception as ex:
+            logger.exception(
+                "[VideoRecorder] Finalize error | filename=%s | error=%s",
+                dst.name if dst else "?", ex)
+
+    def _abort(self, s: _Session):
+        s.aborted = True
+        try:
+            s.queue.put(None, timeout=2)
+        except queue.Full:
+            pass
+        s.close()
+        try:
+            s.temp_path.unlink()
+        except Exception:
+            pass
